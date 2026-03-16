@@ -1,0 +1,17 @@
+{
+  "name": "ctm",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "install:all": "npm --prefix apps/auth-service install && npm --prefix apps/task-service install && npm --prefix apps/web install",
+    "env:sync": "powershell -ExecutionPolicy Bypass -File ./scripts/sync-local-env.ps1",
+    "db:generate": "npm --prefix apps/auth-service run prisma:generate && npm --prefix apps/task-service run prisma:generate",
+    "db:migrate": "powershell -ExecutionPolicy Bypass -File ./scripts/db-setup-local.ps1",
+    "dev:auth": "npm --prefix apps/auth-service run start:dev",
+    "dev:task": "npm --prefix apps/task-service run start:dev",
+    "dev:web": "npm --prefix apps/web run dev",
+    "build": "npm --prefix apps/auth-service run build && npm --prefix apps/task-service run build && npm --prefix apps/web run build",
+    "verify:stack": "powershell -ExecutionPolicy Bypass -File ./scripts/verify-local-stack.ps1",
+    "verify:local": "powershell -ExecutionPolicy Bypass -File ./scripts/run-local-verify.ps1"
+  }
+}
