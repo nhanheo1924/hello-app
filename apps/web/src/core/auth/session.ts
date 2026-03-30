@@ -152,9 +152,10 @@ export function isTokenExpired(token: string | null): boolean {
 }
 
 export function storeToken(token: unknown): void {
-  if (typeof token === 'string' && token.trim()) {
-    setLocalStorageItem(ACCESS_TOKEN_KEY, token.trim());
-  }
+  // Security-first policy: access token stays in HttpOnly cookie managed by BFF.
+  // Keep this function only for backward compatibility and clear any legacy token.
+  void token;
+  clearToken();
 }
 
 export function clearToken(): void {
@@ -162,17 +163,13 @@ export function clearToken(): void {
 }
 
 export function getToken(): string | null {
-  const token = readToken();
-  if (!token) {
-    return null;
-  }
-
-  if (isTokenExpired(token)) {
+  // Never expose session token to JS runtime in cookie-session mode.
+  // Also cleanup legacy localStorage token from older deployments.
+  const legacyToken = readToken();
+  if (legacyToken) {
     clearToken();
-    return null;
   }
-
-  return token;
+  return null;
 }
 
 function normalizeDateString(value: unknown): string | null {

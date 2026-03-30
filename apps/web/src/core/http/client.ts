@@ -56,6 +56,7 @@ export async function httpRequest<T>(url: string, options: HttpRequestOptions = 
   });
 
   const headers = new Headers(requestOptions.headers || {});
+  const credentials = requestOptions.credentials ?? 'include';
   const hasBody = requestOptions.body !== undefined && requestOptions.body !== null;
   const isFormDataPayload =
     typeof FormData !== 'undefined' && requestOptions.body instanceof FormData;
@@ -71,6 +72,7 @@ export async function httpRequest<T>(url: string, options: HttpRequestOptions = 
   try {
     const response = await fetch(url, {
       ...requestOptions,
+      credentials,
       headers
     });
 

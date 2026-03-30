@@ -1,7 +1,6 @@
-import { getToken } from '../../core/auth/session';
-
 const STYLE_ID = 'orbit-header-hub-style';
 const ACTIVE_WORKSPACE_STORAGE_KEY = 'orbitActiveWorkspaceIdV1';
+const HOT_ROUTE_NAV_STORAGE_KEY = 'orbitHotRouteNavV1';
 const WORKSPACE_ID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -288,10 +287,6 @@ function resolveWorkspaceSettingsPath(workspaceId: string): string {
 }
 
 export function mountHeaderHub(): void {
-  if (!getToken()) {
-    return;
-  }
-
   const header = document.querySelector<HTMLElement>('.content-header');
   if (!header) {
     return;
@@ -343,7 +338,32 @@ export function mountHeaderHub(): void {
       window.OrbitAuth && typeof window.OrbitAuth.resolvePath === 'function'
         ? window.OrbitAuth.resolvePath('/setting/#tab-account')
         : '/setting/#tab-account';
-    window.location.href = path;
+    const resolved = new URL(path, window.location.origin);
+    const routePath = `${resolved.pathname}${resolved.search}${resolved.hash}`;
+    try {
+      const fromPath = window.location.pathname || '/home/';
+      window.sessionStorage.setItem(
+        HOT_ROUTE_NAV_STORAGE_KEY,
+        JSON.stringify({
+          from: fromPath,
+          to: resolved.pathname,
+          at: Date.now(),
+        }),
+      );
+    } catch {
+      // ignore navigation hint failures
+    }
+    if (window.parent && window.parent !== window) {
+      window.parent.postMessage(
+        {
+          type: 'orbit-shell-navigate',
+          path: routePath,
+        },
+        window.location.origin,
+      );
+      return;
+    }
+    window.location.href = resolved.toString();
   });
 
   const panel = document.createElement('section');
@@ -376,6 +396,22 @@ export function mountHeaderHub(): void {
   const emailInput = panel.querySelector<HTMLInputElement>('[data-el="email"]');
   const roleSelect = panel.querySelector<HTMLSelectElement>('[data-el="role"]');
 
+  function replaceWorkspaceOptions(
+    selector: HTMLSelectElement,
+    rows: Array<{ id?: unknown; name?: unknown }>,
+  ): void {
+    selector.textContent = '';
+    rows.forEach((workspace) => {
+      const option = document.createElement('option');
+      option.value = typeof workspace.id === 'string' ? workspace.id : '';
+      option.textContent =
+        typeof workspace.name === 'string' && workspace.name.trim()
+          ? workspace.name
+          : 'Workspace';
+      selector.appendChild(option);
+    });
+  }
+
   async function loadWorkspaceSelector(): Promise<void> {
     const selector = document.getElementById('orbitWorkspaceSelector') as HTMLSelectElement | null;
     if (!selector || !window.OrbitTaskApi || typeof window.OrbitTaskApi.listWorkspaces !== 'function') {
@@ -388,9 +424,7 @@ export function mountHeaderHub(): void {
       await window.OrbitTaskApi.ensureWorkspace('My Workspace');
       const refreshed = await window.OrbitTaskApi.listWorkspaces(1, 100);
       const refreshedRows = Array.isArray(refreshed?.data) ? refreshed.data : [];
-      selector.innerHTML = refreshedRows
-        .map((workspace: any) => `<option value="${workspace.id}">${workspace.name}</option>`)
-        .join('');
+      replaceWorkspaceOptions(selector, refreshedRows as Array<{ id?: unknown; name?: unknown }>);
       if (refreshedRows.length > 0) {
         const fallbackId = getActiveWorkspaceId() || String(refreshedRows[0].id || '');
         if (isWorkspaceId(fallbackId)) {
@@ -401,9 +435,7 @@ export function mountHeaderHub(): void {
       return;
     }
 
-    selector.innerHTML = rows
-      .map((workspace: any) => `<option value="${workspace.id}">${workspace.name}</option>`)
-      .join('');
+    replaceWorkspaceOptions(selector, rows as Array<{ id?: unknown; name?: unknown }>);
     if (rows.length > 0) {
       const fallbackId = getActiveWorkspaceId() || String(rows[0].id || '');
       if (isWorkspaceId(fallbackId)) {

@@ -38,6 +38,7 @@ const DEFAULT_SCOPE = 'default';
 const ADMIN_SCOPE = 'admin';
 const ADMIN_USER_KEY = 'admin:*';
 const ADMIN_SYSTEM_ROLES = new Set(['SYSTEM_ADMIN', 'SUPER_ADMIN']);
+const AUTH_ACCESS_COOKIE_NAME = 'ctm_at';
 const WORKSPACE_ID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -383,10 +384,16 @@ export class SyncService implements OnModuleInit, OnModuleDestroy {
     const tokenFromQuery = request.query?.token;
     const queryToken =
       typeof tokenFromQuery === 'string' ? tokenFromQuery : undefined;
+    const cookies = request.cookies as Record<string, unknown> | undefined;
+    const tokenFromCookie =
+      cookies && typeof cookies[AUTH_ACCESS_COOKIE_NAME] === 'string'
+        ? String(cookies[AUTH_ACCESS_COOKIE_NAME]).trim()
+        : '';
     return this.extractAccessTokenFromHeaders(
       request.headers,
       tokenOverride,
       queryToken,
+      tokenFromCookie,
     );
   }
 
@@ -394,6 +401,7 @@ export class SyncService implements OnModuleInit, OnModuleDestroy {
     headers: IncomingHttpHeaders,
     tokenOverride?: string,
     queryToken?: string,
+    cookieTokenHint?: string,
   ): string {
     const override = String(tokenOverride || '').trim();
     if (override) return override;
@@ -403,11 +411,43 @@ export class SyncService implements OnModuleInit, OnModuleDestroy {
       return authHeader.slice(7).trim();
     }
 
+    const tokenFromCookieHint = String(cookieTokenHint || '').trim();
+    if (tokenFromCookieHint) {
+      return tokenFromCookieHint;
+    }
+
+    const cookieHeader = String(headers.cookie || '').trim();
+    if (cookieHeader) {
+      const tokenFromCookie = this.extractCookieValue(
+        cookieHeader,
+        AUTH_ACCESS_COOKIE_NAME,
+      );
+      if (tokenFromCookie) {
+        return tokenFromCookie;
+      }
+    }
+
     if (typeof queryToken === 'string' && queryToken.trim()) {
       return queryToken.trim();
     }
 
     return '';
+  }
+
+  private extractCookieValue(cookieHeader: string, key: string): string {
+    const target = `${key}=`;
+    const segments = String(cookieHeader || '')
+      .split(';')
+      .map((part) => part.trim());
+    const entry = segments.find((part) => part.startsWith(target));
+    if (!entry) {
+      return '';
+    }
+    try {
+      return decodeURIComponent(entry.slice(target.length)).trim();
+    } catch {
+      return entry.slice(target.length).trim();
+    }
   }
 
   private extractSystemRole(payload: Record<string, unknown>): string {

@@ -5,7 +5,6 @@
   markAllNotificationsRead,
   markNotificationRead,
 } from './governance-api';
-import { getToken } from '../../core/auth/session';
 
 const WIDGET_STYLE_ID = 'orbit-notification-widget-style';
 
@@ -59,10 +58,6 @@ function toNotificationRows(raw: unknown): Array<Record<string, unknown>> {
 }
 
 export function mountNotificationWidget(): void {
-  if (!getToken()) {
-    return;
-  }
-
   const host =
     document.querySelector<HTMLElement>('.header-governance-actions') ||
     document.querySelector<HTMLElement>('.content-header .header-right') ||
@@ -150,9 +145,13 @@ export function mountNotificationWidget(): void {
       return;
     }
 
+    listNode.textContent = '';
     if (rows.length === 0) {
       latestRowsById = new Map();
-      listNode.innerHTML = '<li class="orbit-notify-empty">No notifications</li>';
+      const emptyNode = document.createElement('li');
+      emptyNode.className = 'orbit-notify-empty';
+      emptyNode.textContent = 'No notifications';
+      listNode.appendChild(emptyNode);
       return;
     }
 
@@ -160,22 +159,34 @@ export function mountNotificationWidget(): void {
       rows.map((row) => [typeof row.id === 'string' ? row.id : '', row]),
     );
 
-    listNode.innerHTML = rows
-      .map((row) => {
-        const id = typeof row.id === 'string' ? row.id : '';
-        const title = typeof row.title === 'string' ? row.title : 'Notification';
-        const body = typeof row.body === 'string' ? row.body : '';
-        const createdAt = formatTime(row.createdAt);
-        const unread = row.isRead !== true;
-        return `
-          <li class="orbit-notify-item ${unread ? 'unread' : ''}" data-id="${id}">
-            <div class="orbit-notify-title">${title}</div>
-            <div class="orbit-notify-body">${body}</div>
-            <div class="orbit-notify-time">${createdAt}</div>
-          </li>
-        `;
-      })
-      .join('');
+    rows.forEach((row) => {
+      const id = typeof row.id === 'string' ? row.id : '';
+      const title = typeof row.title === 'string' ? row.title : 'Notification';
+      const body = typeof row.body === 'string' ? row.body : '';
+      const createdAt = formatTime(row.createdAt);
+      const unread = row.isRead !== true;
+
+      const itemNode = document.createElement('li');
+      itemNode.className = `orbit-notify-item${unread ? ' unread' : ''}`;
+      itemNode.dataset.id = id;
+
+      const titleNode = document.createElement('div');
+      titleNode.className = 'orbit-notify-title';
+      titleNode.textContent = title;
+      itemNode.appendChild(titleNode);
+
+      const bodyNode = document.createElement('div');
+      bodyNode.className = 'orbit-notify-body';
+      bodyNode.textContent = body;
+      itemNode.appendChild(bodyNode);
+
+      const timeNode = document.createElement('div');
+      timeNode.className = 'orbit-notify-time';
+      timeNode.textContent = createdAt;
+      itemNode.appendChild(timeNode);
+
+      listNode.appendChild(itemNode);
+    });
   }
 
   async function refreshNotifications(): Promise<void> {
@@ -184,7 +195,11 @@ export function mountNotificationWidget(): void {
       renderList(toNotificationRows(response.data));
     } catch {
       if (listNode) {
-        listNode.innerHTML = '<li class="orbit-notify-empty">Cannot load notifications</li>';
+        listNode.textContent = '';
+        const emptyNode = document.createElement('li');
+        emptyNode.className = 'orbit-notify-empty';
+        emptyNode.textContent = 'Cannot load notifications';
+        listNode.appendChild(emptyNode);
       }
     }
   }
@@ -305,7 +320,7 @@ export function mountNotificationWidget(): void {
   void refreshUnreadCount();
   startStream();
 
-  window.addEventListener('beforeunload', () => {
+  window.addEventListener('pagehide', () => {
     stopStream?.();
     stopPolling();
     stopReconnect();

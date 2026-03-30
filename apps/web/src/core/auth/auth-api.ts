@@ -87,8 +87,6 @@ type ChangePasswordResult =
   | { ok: true; success: true }
   | { ok: false; error: string };
 
-const SIGN_IN_MAX_ATTEMPTS = 4;
-const SIGN_IN_RETRY_DELAY_MS = 1500;
 const AUTH_PROFILE_RESOURCE_KEY = 'auth.me.profile';
 const AUTH_PROFILE_SESSION_CACHE_KEY = 'orbitAuthProfileCacheV1';
 const AUTH_PROFILE_TTL_MS = 5 * 60 * 1000;
@@ -96,7 +94,7 @@ const AUTH_PROFILE_TTL_MS = 5 * 60 * 1000;
 async function authRequest<T>(
   path: string,
   options: RequestInit = {},
-  authToken: string | null = getToken()
+  authToken: string | null = null
 ): Promise<T> {
   return httpRequest<T>(`${AUTH_API_BASE_URL}${path}`, {
     credentials: 'include',
@@ -105,30 +103,10 @@ async function authRequest<T>(
   });
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function extractErrorMessage(error: unknown, fallbackMessage: string): string {
   return error && typeof error === 'object' && 'message' in error
     ? String((error as { message?: string }).message || fallbackMessage)
     : fallbackMessage;
-}
-
-function shouldRetrySignInError(error: unknown): boolean {
-  if (!error || typeof error !== 'object') {
-    return false;
-  }
-
-  const status = 'status' in error ? Number((error as { status?: number }).status) : 0;
-  if (status === 502 || status === 503 || status === 504) {
-    return true;
-  }
-
-  const message = 'message' in error
-    ? String((error as { message?: string }).message || '').toLowerCase()
-    : '';
-  return message.includes('failed to fetch') || message.includes('fetch failed');
 }
 
 function buildGoogleStartUrl(): string {
@@ -177,29 +155,8 @@ export function invalidateProfileCache(): void {
   clearSessionProfileCache();
 }
 
-async function requestSignInWithRetry(payload: { email: string; password: string }) {
-  let lastError: unknown = null;
-
-  for (let attempt = 1; attempt <= SIGN_IN_MAX_ATTEMPTS; attempt += 1) {
-    try {
-      return await authRequest<AuthApiResponse>('/login', {
-        method: 'POST',
-        body: JSON.stringify(payload)
-      });
-    } catch (error) {
-      lastError = error;
-      if (!shouldRetrySignInError(error) || attempt >= SIGN_IN_MAX_ATTEMPTS) {
-        throw error;
-      }
-      await sleep(SIGN_IN_RETRY_DELAY_MS * attempt);
-    }
-  }
-
-  throw lastError;
-}
-
 function completeSessionFromResponse(response: AuthApiResponse): AuthUser | null {
-  storeToken(response.accessToken);
+  clearToken();
   const user = storeUser(response.user || null);
   if (user) {
     writeSessionProfileCache(user);
@@ -216,7 +173,10 @@ export async function signIn(input: { email: string; password: string }): Promis
       password: String(input.password || '')
     };
 
-    const response = await requestSignInWithRetry(payload);
+    const response = await authRequest<AuthApiResponse>('/login', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
 
     if (response.requiresTwoFactor === true) {
       return {
@@ -270,6 +230,42 @@ export async function registerUser(input: {
   }
 }
 
+export async function exchangeOauthCode(oauthCode: string): Promise<SignInResult> {
+  const normalizedCode = String(oauthCode || '').trim();
+  if (!normalizedCode) {
+    return {
+      ok: false,
+      error: 'Missing OAuth exchange code.'
+    };
+  }
+
+  try {
+    const response = await authRequest<AuthApiResponse>('/oauth/exchange', {
+      method: 'POST',
+      body: JSON.stringify({ oauthCode: normalizedCode })
+    });
+
+    if (response.requiresTwoFactor === true) {
+      return {
+        ok: false,
+        requiresTwoFactor: true,
+        twoFactorToken: typeof response.twoFactorToken === 'string'
+          ? response.twoFactorToken
+          : undefined,
+        error: 'This account requires 2FA verification.'
+      };
+    }
+
+    const user = completeSessionFromResponse(response);
+    return { ok: true, user };
+  } catch (error) {
+    return {
+      ok: false,
+      error: extractErrorMessage(error, 'Unable to authenticate OAuth callback.')
+    };
+  }
+}
+
 export async function verifyTwoFactorLogin(input: {
   otp?: string;
   backupCode?: string;
@@ -293,8 +289,7 @@ export async function verifyTwoFactorLogin(input: {
           backupCode: backupCode || undefined,
           twoFactorToken: twoFactorToken || undefined
         })
-      },
-      null
+      }
     );
 
     if (response.requiresTwoFactor === true) {
@@ -382,11 +377,6 @@ export async function disableTwoFactor(input: {
 }
 
 export async function getCurrentUser(options?: { forceRefresh?: boolean }) {
-  const token = getToken();
-  if (!token) {
-    invalidateProfileCache();
-    return null;
-  }
   const forceRefresh = options?.forceRefresh === true;
 
   if (!forceRefresh && isFresh(AUTH_PROFILE_RESOURCE_KEY, AUTH_PROFILE_TTL_MS)) {
@@ -482,11 +472,6 @@ export async function changePassword(
 }
 
 export async function requireAuth(redirectPath = appRoutes.signin) {
-  if (!getToken()) {
-    window.location.href = resolveAppPath(redirectPath);
-    return null;
-  }
-
   const user = await getCurrentUser();
   if (!user) {
     clearToken();
@@ -498,12 +483,10 @@ export async function requireAuth(redirectPath = appRoutes.signin) {
 }
 
 export async function signOut(options?: { redirectTo?: string }) {
-  if (getToken()) {
-    try {
-      await authRequest('/logout', { method: 'POST' });
-    } catch {
-      // ignore logout failure and clear local session regardless
-    }
+  try {
+    await authRequest('/logout', { method: 'POST' });
+  } catch {
+    // ignore logout failure and clear local session regardless
   }
 
   clearToken();
@@ -523,6 +506,7 @@ export function createAuthCompat() {
     validateEmail,
     validatePassword,
     signIn,
+    exchangeOauthCode,
     verifyTwoFactorLogin,
     registerUser,
     getCurrentUser,

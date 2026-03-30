@@ -1,0 +1,43 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "trailingSlash": true,
+  "cleanUrls": false,
+  "rewrites": [
+    {
+      "source": "/landing",
+      "destination": "/landing/"
+    },
+    {
+      "source": "/signin",
+      "destination": "/signin/"
+    },
+    {
+      "source": "/signup",
+      "destination": "/signup/"
+    },
+    {
+      "source": "/home",
+      "destination": "/home/"
+    },
+    {
+      "source": "/admin",
+      "destination": "/admin/"
+    },
+    {
+      "source": "/setting",
+      "destination": "/setting/"
+    },
+    {
+      "source": "/workspace-setting",
+      "destination": "/workspace-setting/"
+    },
+    {
+      "source": "/about",
+      "destination": "/about/"
+    },
+    {
+      "source": "/auth/callback",
+      "destination": "/auth/callback/"
+    }
+  ]
+}

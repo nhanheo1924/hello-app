@@ -81,11 +81,101 @@ async function bootstrapSettingPage() {
     if (remMinusBtn) remMinusBtn.textContent = '\u2212';
     const avatarDisplay = document.getElementById('avatarDisplay');
     if (avatarDisplay && !avatarDisplay.querySelector('img')) avatarDisplay.textContent = '\u2726';
+    const HOT_ROUTE_NAV_KEY = 'orbitHotRouteNavV1';
+    const HOT_ROUTE_NAV_TTL_MS = 2 * 60 * 1000;
+
+    function parseHotRouteNavigation() {
+        try {
+            const raw = sessionStorage.getItem(HOT_ROUTE_NAV_KEY);
+            if (!raw) return null;
+            const parsed = JSON.parse(raw);
+            return parsed && typeof parsed === 'object' ? parsed : null;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function clearHotRouteNavigation() {
+        try {
+            sessionStorage.removeItem(HOT_ROUTE_NAV_KEY);
+        } catch (_) {
+            // ignore cache cleanup failures
+        }
+    }
+
+    function resolveHomePath() {
+        const homeUrl = new URL(route('/home/'), window.location.origin);
+        return `${homeUrl.pathname}${homeUrl.search}${homeUrl.hash}`;
+    }
+
+    function canBackToHomeFromHistory() {
+        if (window.history.length <= 1) {
+            return false;
+        }
+
+        const navHint = parseHotRouteNavigation();
+        const fromPath = navHint && typeof navHint.from === 'string' ? navHint.from : '';
+        const toPath = navHint && typeof navHint.to === 'string' ? navHint.to : '';
+        const changedAt = Number(navHint && navHint.at);
+        const normalizedFromPath = String(fromPath || '').trim();
+        const normalizedToPath = String(toPath || '').trim();
+        const isHotPathHint = normalizedFromPath.endsWith('/home/') && normalizedToPath.endsWith('/setting/');
+        const isFreshHint = Number.isFinite(changedAt) && Date.now() - changedAt <= HOT_ROUTE_NAV_TTL_MS;
+
+        if (isHotPathHint && isFreshHint) {
+            return true;
+        }
+
+        if (!document.referrer) {
+            return false;
+        }
+
+        try {
+            const referrerUrl = new URL(document.referrer);
+            return referrerUrl.origin === window.location.origin && referrerUrl.pathname.endsWith('/home/');
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function navigateBackToHome() {
+        const homePath = resolveHomePath();
+        const shouldUseHistoryBack = canBackToHomeFromHistory();
+        clearHotRouteNavigation();
+
+        if (shouldUseHistoryBack) {
+            window.history.back();
+            return;
+        }
+
+        if (window.parent && window.parent !== window) {
+            window.parent.postMessage(
+                {
+                    type: 'orbit-shell-navigate',
+                    path: homePath
+                },
+                window.location.origin
+            );
+            return;
+        }
+
+        window.location.href = homePath;
+    }
+
     const logo = document.querySelector('.logo');
     if (logo) {
         logo.style.cursor = 'pointer';
-        logo.addEventListener('click', () => {
-            window.location.href = route('/home/');
+        logo.addEventListener('click', navigateBackToHome);
+    }
+
+    const settingsBackToHomeNav = document.getElementById('settingsBackToHomeNav');
+    if (settingsBackToHomeNav) {
+        settingsBackToHomeNav.addEventListener('click', navigateBackToHome);
+        settingsBackToHomeNav.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                navigateBackToHome();
+            }
         });
     }
 
@@ -193,9 +283,6 @@ async function bootstrapSettingPage() {
         }
 
         if (!window.OrbitTaskApi || typeof window.OrbitTaskApi.ensureWorkspace !== 'function') {
-            return cachedSnapshot || [];
-        }
-        if (!window.OrbitTaskApi.getToken()) {
             return cachedSnapshot || [];
         }
         try {

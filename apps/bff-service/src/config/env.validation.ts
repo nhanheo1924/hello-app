@@ -12,6 +12,11 @@ export const envValidationSchema = Joi.object({
   CORS_ORIGIN: Joi.string().allow('').default('http://localhost:5173'),
   AUTH_SERVICE_BASE_URL: Joi.string().uri().default('http://localhost:3000/api/auth'),
   TASK_SERVICE_BASE_URL: Joi.string().uri().default('http://localhost:3102/api'),
+  AUTH_ACCESS_COOKIE_NAME: Joi.string().default('ctm_at'),
+  AUTH_ACCESS_COOKIE_DOMAIN: Joi.string().allow('').default(''),
+  AUTH_ACCESS_COOKIE_SAMESITE: Joi.string()
+    .valid('strict', 'lax', 'none')
+    .default('strict'),
   INTERNAL_PROXY_SECRET: Joi.string()
     .min(32)
     .when('NODE_ENV', {
@@ -20,6 +25,11 @@ export const envValidationSchema = Joi.object({
       otherwise: Joi.string().min(32).default(devDefaultProxySecret),
     }),
   UPSTREAM_TIMEOUT_MS: Joi.number().integer().min(1000).max(120000).default(15000),
+  AUTH_CRITICAL_UPSTREAM_TIMEOUT_MS: Joi.number()
+    .integer()
+    .min(1000)
+    .max(120000)
+    .default(8000),
   UPSTREAM_MAX_ATTEMPTS: Joi.number().integer().min(1).max(10).default(3),
   UPSTREAM_RETRY_DELAY_MS: Joi.number().integer().min(50).max(10000).default(400),
 });

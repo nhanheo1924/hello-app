@@ -27,6 +27,7 @@ import { ConfirmTwoFactorDto } from './dto/confirm-two-factor.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
 import { DisableTwoFactorDto } from './dto/disable-two-factor.dto';
 import { LoginDto } from './dto/login.dto';
+import { OauthExchangeDto } from './dto/oauth-exchange.dto';
 import {
   AdminAuditLogsQueryDto,
   AdminUsersQueryDto,
@@ -293,10 +294,11 @@ export class AuthController {
         );
       }
 
-      // successful login; send token back via query param for frontend to consume
+      // successful login; return a short-lived one-time exchange code
       const successUrl = this.buildWebOauthCallbackUrl(callbackUrlFromCookie);
-      // redirect back to the sign‑in page with the token so frontend can pick it up
-      successUrl.searchParams.set('token', result.accessToken);
+      // redirect back to frontend callback with oauthCode (no access token in URL)
+      const oauthCode = await this.authService.createOauthExchangeCode(result);
+      successUrl.searchParams.set('oauthCode', oauthCode);
       return response.redirect(successUrl.toString());
     } catch {
       return this.redirectToWeb(
@@ -318,6 +320,15 @@ export class AuthController {
     return {
       user: this.toUserResponse(user),
     };
+  }
+
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @Post('oauth/exchange')
+  async oauthExchange(@Body() dto: OauthExchangeDto) {
+    const result = await this.authService.consumeOauthExchangeCode(
+      dto.oauthCode,
+    );
+    return this.toAuthResponse(result);
   }
 
   @UseGuards(JwtAuthGuard)
@@ -698,3 +709,4 @@ export class AuthController {
     return withLeadingSlash.replace(/\/+$/, '');
   }
 }
+

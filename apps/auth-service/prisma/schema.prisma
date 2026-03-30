@@ -131,3 +131,15 @@ model AuditLog {
   @@index([createdAt])
   @@map("audit_logs")
 }
+
+model OauthExchangeCode {
+  id         String    @id @default(uuid()) @db.Uuid
+  codeHash   String    @unique @map("code_hash")
+  payloadJson Json     @map("payload_json")
+  expiresAt  DateTime  @map("expires_at")
+  consumedAt DateTime? @map("consumed_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  @@index([expiresAt], map: "oauth_exchange_codes_expires_at_idx")
+  @@map("oauth_exchange_codes")
+}

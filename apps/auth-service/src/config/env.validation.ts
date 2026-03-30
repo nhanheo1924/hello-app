@@ -54,6 +54,7 @@ export const envValidationSchema = Joi.object({
   WEB_APP_OAUTH_CALLBACK_URL: Joi.string()
     .uri()
     .default('http://localhost:5173/auth/callback/'),
+  OAUTH_EXCHANGE_CODE_EXPIRES_IN: Joi.string().default('60s'),
   GOOGLE_OAUTH_CLIENT_ID: Joi.string().allow('').default(''),
   GOOGLE_OAUTH_CLIENT_SECRET: Joi.string().allow('').default(''),
   GOOGLE_OAUTH_REDIRECT_URI: Joi.string().allow('').default(''),

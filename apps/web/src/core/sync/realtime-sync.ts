@@ -1,5 +1,4 @@
 import { API_BASE_URL } from '../../config/api';
-import { getToken } from '../auth/session';
 
 export type RealtimeSyncStatus = 'connected' | 'reconnecting' | 'offline';
 
@@ -200,19 +199,11 @@ export function createRealtimeSyncCompat() {
       return;
     }
 
-    const token = getToken();
-    if (!token) {
-      stopStream();
-      setStatus('offline');
-      return;
-    }
-
     stopStream();
     setStatus('reconnecting');
 
     const streamUrl = new URL(`${API_BASE_URL}/sync/stream`, window.location.origin);
     streamUrl.searchParams.set('workspaceId', state.workspaceId);
-    streamUrl.searchParams.set('token', token);
 
     const source = new EventSource(streamUrl.toString(), {
       withCredentials: true,
@@ -393,4 +384,3 @@ export function createRealtimeSyncCompat() {
     getStatus,
   };
 }
-

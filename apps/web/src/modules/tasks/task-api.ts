@@ -1,5 +1,5 @@
 import { httpRequest } from '../../core/http/client';
-import { getToken } from '../../core/auth/session';
+import { getStoredUser } from '../../core/auth/session';
 import { API_BASE_URL } from '../../config/api';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -97,11 +97,6 @@ async function request<T>(
   options: RequestInit = {},
   requestOptions: WorkspaceRequestOptions = {},
 ): Promise<T> {
-  const token = getToken();
-  if (!token) {
-    throw { status: 401, message: 'Missing access token' };
-  }
-
   const headers = new Headers(options.headers || {});
   const workspaceHeader = resolveWorkspaceHeader(requestOptions.workspaceId);
   if (workspaceHeader) {
@@ -111,8 +106,13 @@ async function request<T>(
   return httpRequest<T>(`${API_BASE_URL}${path}`, {
     ...options,
     headers,
-    authToken: token,
+    credentials: 'include',
   });
+}
+
+function getSessionHintToken(): string | null {
+  const storedUser = getStoredUser();
+  return storedUser ? 'cookie-session' : null;
 }
 
 export async function listWorkspaces(page?: number, limit?: number) {
@@ -535,7 +535,7 @@ export async function moveTask(
 export function createTaskApiCompat() {
   return {
     apiBase: API_BASE_URL,
-    getToken,
+    getToken: getSessionHintToken,
     request,
     listWorkspaces,
     createWorkspace,

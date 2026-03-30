@@ -6,32 +6,40 @@ async function bootstrapSigninPage() {
             : path
     );
     const params = new URLSearchParams(window.location.search);
-    const googleToken = params.get('token');
     const googleStatus = params.get('google');
     const googleMessage = params.get('message');
     const state = {
         twoFactorMode: false,
-        twoFactorToken: ''
+        twoFactorToken: '',
+        isSubmitting: false
     };
 
-    // If OAuth callback appends a token, store it and continue to home.
-    if (googleToken) {
-        if (auth && typeof auth.storeToken === 'function') {
-            auth.storeToken(googleToken);
-        } else {
-            localStorage.setItem('accessToken', googleToken);
+    function navigatePath(path, replace = false) {
+        const target = route(path);
+        const resolved = new URL(target, window.location.origin);
+        const routePath = `${resolved.pathname}${resolved.search}${resolved.hash}`;
+
+        if (window.parent && window.parent !== window) {
+            window.parent.postMessage({
+                type: 'orbit-shell-navigate',
+                path: routePath,
+                replace
+            }, window.location.origin);
+            return;
         }
-        if (auth && typeof auth.getCurrentUser === 'function') {
-            await auth.getCurrentUser({ forceRefresh: true });
+
+        if (replace) {
+            window.location.replace(resolved.toString());
+            return;
         }
-        window.location.href = route('/home/');
-        return;
+
+        window.location.href = resolved.toString();
     }
 
     if (auth) {
         const current = await auth.getCurrentUser();
         if (current) {
-            window.location.href = route('/home/');
+            navigatePath('/home/', true);
             return;
         }
     }
@@ -52,6 +60,15 @@ async function bootstrapSigninPage() {
         form.insertBefore(errorEl, submitBtn);
     } else {
         form.appendChild(errorEl);
+    }
+    const progressEl = document.createElement('div');
+    progressEl.id = 'signin-progress';
+    progressEl.className = 'signin-progress';
+    progressEl.setAttribute('aria-live', 'polite');
+    if (submitBtn) {
+        form.insertBefore(progressEl, submitBtn);
+    } else {
+        form.appendChild(progressEl);
     }
 
     const socialDivider = form.querySelector('.social-divider');
@@ -81,6 +98,30 @@ async function bootstrapSigninPage() {
     const backupInput = twoFactorContainer.querySelector('#two-factor-backup');
     const verifyTwoFactorBtn = twoFactorContainer.querySelector('#two-factor-verify-btn');
     const cancelTwoFactorBtn = twoFactorContainer.querySelector('#two-factor-cancel-btn');
+    let googleSignInBtn = null;
+
+    function setProgress(message = '') {
+        progressEl.textContent = String(message || '');
+        progressEl.classList.toggle('visible', Boolean(message));
+    }
+
+    function setSubmitting(isSubmitting, message = '') {
+        state.isSubmitting = Boolean(isSubmitting);
+        if (emailInput) emailInput.disabled = state.isSubmitting;
+        if (passwordInput) passwordInput.disabled = state.isSubmitting;
+        if (submitBtn) {
+            submitBtn.disabled = state.isSubmitting;
+            submitBtn.textContent = state.isSubmitting ? 'Signing in...' : 'Launch';
+        }
+        if (verifyTwoFactorBtn) verifyTwoFactorBtn.disabled = state.isSubmitting;
+        if (cancelTwoFactorBtn) cancelTwoFactorBtn.disabled = state.isSubmitting;
+        if (googleSignInBtn) googleSignInBtn.disabled = state.isSubmitting;
+        setProgress(message);
+    }
+
+    function navigateToHome() {
+        navigatePath('/home/');
+    }
 
     function setMainModeVisible(visible) {
         if (emailGroup) emailGroup.classList.toggle('hidden', !visible);
@@ -108,6 +149,7 @@ async function bootstrapSigninPage() {
         } else {
             errorEl.textContent = 'Two-factor verification is required.';
         }
+        setProgress('');
 
         if (otpInput) {
             otpInput.focus();
@@ -122,16 +164,20 @@ async function bootstrapSigninPage() {
         setMainModeVisible(true);
         twoFactorContainer.classList.add('hidden');
         errorEl.textContent = '';
+        setSubmitting(false);
     }
 
-    async function finalizeLogin() {
-        const currentUser = await auth.getCurrentUser({ forceRefresh: true });
+    async function finalizeLogin(userFromAuthResult) {
+        if (userFromAuthResult) {
+            navigateToHome();
+            return true;
+        }
+        const currentUser = await auth.getCurrentUser();
         if (!currentUser) {
             errorEl.textContent = 'Signed in but failed to load profile.';
             return false;
         }
-
-        window.location.href = route('/home/');
+        navigateToHome();
         return true;
     }
 
@@ -149,28 +195,26 @@ async function bootstrapSigninPage() {
             return;
         }
 
-        if (verifyTwoFactorBtn) verifyTwoFactorBtn.disabled = true;
-        if (cancelTwoFactorBtn) cancelTwoFactorBtn.disabled = true;
+        setSubmitting(true, 'Verifying two-factor code...');
 
         const result = await auth.verifyTwoFactorLogin({
             otp,
             backupCode,
             twoFactorToken: state.twoFactorToken || undefined
         });
-
-        if (verifyTwoFactorBtn) verifyTwoFactorBtn.disabled = false;
-        if (cancelTwoFactorBtn) cancelTwoFactorBtn.disabled = false;
+        setSubmitting(false);
 
         if (!result.ok) {
             errorEl.textContent = result.error || '2FA verification failed.';
             return;
         }
 
-        await finalizeLogin();
+        await finalizeLogin(result.user);
     }
 
     if (googleContainer) {
         const btn = document.createElement('button');
+        googleSignInBtn = btn;
         btn.type = 'button';
         btn.className = 'btn full-width google-fallback-btn';
         btn.innerHTML = `
@@ -183,6 +227,7 @@ async function bootstrapSigninPage() {
             <span>Continue with Google</span>
         `;
         btn.addEventListener('click', () => {
+            setSubmitting(true, 'Redirecting to Google...');
             if (auth && typeof auth.startGoogleFlow === 'function') {
                 auth.startGoogleFlow();
             } else {
@@ -248,22 +293,17 @@ async function bootstrapSigninPage() {
             return;
         }
 
-        const submit = form.querySelector('button[type="submit"]');
-        if (submit) {
-            submit.disabled = true;
-        }
+        setSubmitting(true, 'Signing in with email...');
 
         const result = await auth.signIn({ email, password });
         if (!result.ok) {
+            setSubmitting(false);
             if (result.requiresTwoFactor) {
                 enterTwoFactorMode({
                     twoFactorToken: result.twoFactorToken,
                     allowCancel: true,
                     message: result.error || 'Two-factor verification is required.'
                 });
-                if (submit) {
-                    submit.disabled = false;
-                }
                 return;
             }
 
@@ -271,17 +311,12 @@ async function bootstrapSigninPage() {
             emailInput.setAttribute('aria-invalid', 'true');
             passwordInput.setAttribute('aria-invalid', 'true');
             passwordInput.focus();
-            if (submit) {
-                submit.disabled = false;
-            }
             return;
         }
 
-        const done = await finalizeLogin();
+        const done = await finalizeLogin(result.user);
         if (!done) {
-            if (submit) {
-                submit.disabled = false;
-            }
+            setSubmitting(false);
             return;
         }
     });

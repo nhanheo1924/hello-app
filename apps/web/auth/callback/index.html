@@ -3,10 +3,78 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Authenticating...</title>
+    <title>Authenticating</title>
+    <style>
+        :root {
+            color-scheme: dark;
+        }
+        * {
+            box-sizing: border-box;
+        }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            display: grid;
+            place-items: center;
+            background: radial-gradient(circle at 20% 20%, #20263a 0%, #0b0c10 42%, #06070b 100%);
+            color: rgba(255, 255, 255, 0.9);
+            font-family: "Inter", "Segoe UI", Arial, sans-serif;
+        }
+        .callback-card {
+            width: min(460px, calc(100vw - 40px));
+            border: 1px solid rgba(255, 255, 255, 0.16);
+            border-radius: 18px;
+            background: rgba(15, 16, 24, 0.88);
+            backdrop-filter: blur(12px);
+            padding: 24px 22px;
+            box-shadow: 0 22px 52px rgba(0, 0, 0, 0.45);
+        }
+        .callback-status-row {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+        .callback-spinner {
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            border: 2px solid rgba(255, 255, 255, 0.22);
+            border-top-color: rgba(255, 255, 255, 0.88);
+            animation: spin 0.9s linear infinite;
+            flex-shrink: 0;
+        }
+        .callback-status-title {
+            margin: 0;
+            font-size: 1rem;
+            letter-spacing: 0.02em;
+            color: rgba(255, 255, 255, 0.96);
+        }
+        .callback-status-detail {
+            margin: 8px 0 0;
+            font-size: 0.88rem;
+            color: rgba(255, 255, 255, 0.72);
+            line-height: 1.45;
+            min-height: 1.3em;
+        }
+        body.is-error .callback-spinner {
+            border-top-color: #ff9090;
+        }
+        body.is-error .callback-status-title {
+            color: #ffc2c2;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
 </head>
 <body>
-    <p>Authenticating...</p>
+    <section class="callback-card" aria-live="polite">
+        <div class="callback-status-row">
+            <div class="callback-spinner" aria-hidden="true"></div>
+            <h1 class="callback-status-title" id="auth-callback-status-title">Authenticating</h1>
+        </div>
+        <p class="callback-status-detail" id="auth-callback-status-detail">Validating your login session...</p>
+    </section>
     <script type="module" src="../../src/pages/auth-callback/main.ts"></script>
 </body>
 </html>

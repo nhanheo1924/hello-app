@@ -1,5 +1,4 @@
 ﻿import { AUTH_API_BASE_URL, API_BASE_URL } from '../../config/api';
-import { getToken } from '../../core/auth/session';
 import { httpRequest } from '../../core/http/client';
 
 import { beginGlobalLoading } from '../../core/ui/loading';
@@ -34,26 +33,16 @@ function toQueryString(params: QueryParams = {}): string {
 }
 
 async function requestTask<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const token = getToken();
-  if (!token) {
-    throw { status: 401, message: 'Missing access token' };
-  }
-
   return httpRequest<T>(`${API_BASE_URL}${path}`, {
     ...options,
-    authToken: token,
+    credentials: 'include',
   });
 }
 
 async function requestAuth<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const token = getToken();
-  if (!token) {
-    throw { status: 401, message: 'Missing access token' };
-  }
-
   return httpRequest<T>(`${AUTH_API_BASE_URL}${path}`, {
     ...options,
-    authToken: token,
+    credentials: 'include',
   });
 }
 
@@ -89,15 +78,11 @@ export async function markAllNotificationsRead() {
 }
 
 export function connectNotificationsStream(handlers: NotificationStreamHandlers = {}) {
-  const token = getToken();
-  if (!token) {
-    return () => undefined;
-  }
-
   const streamUrl = new URL(`${API_BASE_URL}/notifications/stream`, window.location.origin);
-  streamUrl.searchParams.set('token', token);
 
-  const source = new EventSource(streamUrl.toString());
+  const source = new EventSource(streamUrl.toString(), {
+    withCredentials: true,
+  });
   source.addEventListener('notification.created', (event) => {
     handlers.onCreated?.(safeParseEventData(event));
   });
@@ -259,11 +244,6 @@ export async function exportReportCsv(
   workspaceId: string,
   query: QueryParams,
 ): Promise<{ filename: string; blob: Blob }> {
-  const token = getToken();
-  if (!token) {
-    throw { status: 401, message: 'Missing access token' };
-  }
-
   const stopLoading = beginGlobalLoading({
     trackLoading: true,
     loadingScope: 'report.export',
@@ -274,9 +254,7 @@ export async function exportReportCsv(
     const url = `${API_BASE_URL}/workspaces/${encodeURIComponent(workspaceId)}/reports/export.csv${toQueryString(query)}`;
     const response = await fetch(url, {
       method: 'GET',
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
+      credentials: 'include',
     });
     if (!response.ok) {
       throw { status: response.status, message: `Request failed (${response.status})` };
@@ -340,25 +318,18 @@ export async function listAdminAuditLogs(query: QueryParams = {}) {
   );
 }
 
-function buildAdminRealtimeUrl(token: string): URL {
+function buildAdminRealtimeUrl(): URL {
   const apiBase = new URL(API_BASE_URL, window.location.origin);
   const wsUrl = new URL(apiBase.toString());
   wsUrl.protocol = apiBase.protocol === 'https:' ? 'wss:' : 'ws:';
   wsUrl.pathname = `${apiBase.pathname.replace(/\/+$/, '')}/sync/ws`;
   wsUrl.search = '';
-  wsUrl.searchParams.set('token', token);
   wsUrl.searchParams.set('scope', 'admin');
   wsUrl.searchParams.set('workspaceId', '*');
   return wsUrl;
 }
 
 export function connectAdminRealtime(handlers: AdminRealtimeHandlers = {}) {
-  const token = getToken();
-  if (!token) {
-    handlers.onStatusChange?.('offline');
-    return () => undefined;
-  }
-
   let socket: WebSocket | null = null;
   let reconnectTimer: number | null = null;
   let reconnectAttempt = 0;
@@ -392,7 +363,7 @@ export function connectAdminRealtime(handlers: AdminRealtimeHandlers = {}) {
   const connect = () => {
     if (disconnected) return;
     try {
-      const wsUrl = buildAdminRealtimeUrl(token);
+      const wsUrl = buildAdminRealtimeUrl();
       setStatus('reconnecting');
       socket = new WebSocket(wsUrl.toString());
     } catch (error) {

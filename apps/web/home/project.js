@@ -30,6 +30,7 @@ const PROJECTS_CACHE_STORAGE_KEY = 'orbitProjectsCacheV1';
 const PENDING_SYNC_STORAGE_KEY = 'orbitPendingSyncV1';
 const PROJECT_ACCESS_INDEX_STORAGE_KEY = 'orbitProjectAccessIndexV1';
 const WORKSPACE_DISPLAY_SETTINGS_STORAGE_KEY = 'orbitWorkspaceDisplaySettingsV1';
+const HOT_ROUTE_NAV_STORAGE_KEY = 'orbitHotRouteNavV1';
 const DASHBOARD_SYNC_RESOURCE_KEY = 'dashboard.remote.projects';
 const DASHBOARD_LAST_SYNC_AT_KEY = 'orbitDashboardLastSyncAtV1';
 const FILTER_DEBOUNCE_MS = 150;
@@ -357,7 +358,25 @@ function routePath(path) {
         : path;
 }
 
+function writeHotRouteNavigation(fromPath, toPath) {
+    try {
+        const fromUrl = new URL(routePath(fromPath), window.location.origin);
+        const toUrl = new URL(toPath, window.location.origin);
+        sessionStorage.setItem(
+            HOT_ROUTE_NAV_STORAGE_KEY,
+            JSON.stringify({
+                from: fromUrl.pathname,
+                to: toUrl.pathname,
+                at: Date.now()
+            })
+        );
+    } catch (_) {
+        // ignore sessionStorage errors
+    }
+}
+
 function navigateTo(url) {
+    writeHotRouteNavigation('/home/', url);
     document.body.classList.add('fade-out');
     setTimeout(() => {
         window.location.href = url;
@@ -3523,7 +3542,7 @@ function setupEventListeners() {
             layoutAllTasks();
         }
     });
-    window.addEventListener('beforeunload', () => {
+    window.addEventListener('pagehide', () => {
         if (state.filters.debounceTimer) {
             clearTimeout(state.filters.debounceTimer);
             state.filters.debounceTimer = null;
@@ -3532,6 +3551,9 @@ function setupEventListeners() {
         if (realtimeSync && typeof realtimeSync.disconnect === 'function') {
             realtimeSync.disconnect();
         }
+    });
+    window.addEventListener('pageshow', () => {
+        scheduleConnectionProbe(true);
     });
     document.addEventListener('visibilitychange', () => {
         scheduleConnectionProbe(true);

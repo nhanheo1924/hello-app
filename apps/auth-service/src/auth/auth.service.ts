@@ -86,6 +86,32 @@ interface AdminAuditLogsQuery {
   to?: string;
 }
 
+type OauthExchangePayload = {
+  accessToken: string;
+  expiresIn: number;
+  session: {
+    sid: string;
+  };
+  user: {
+    id: string;
+    email: string;
+    status: UserStatus;
+    systemRole: SystemRole;
+    firstName: string | null;
+    lastName: string | null;
+    displayName: string | null;
+    dob: string | null;
+    address: string | null;
+    avatarUrl: string | null;
+    timezone: string | null;
+    locale: string | null;
+    fullName: string | null;
+    twoFactorEnabled: boolean;
+    createdAt: string;
+    updatedAt: string;
+  };
+};
+
 type PrismaTx = Prisma.TransactionClient;
 
 const SYSTEM_ADMIN_ROLES = new Set<SystemRole>([
@@ -122,6 +148,7 @@ export interface TwoFactorSetupPayload {
 export class AuthService {
   private readonly accessTokenExpiresIn: StringValue;
   private readonly accessTokenExpiresInSeconds: number;
+  private readonly oauthExchangeCodeExpiresInMs: number;
   private readonly twoFactorChallengeExpiresIn: StringValue;
   private readonly twoFactorIssuer: string;
   private readonly twoFactorEncryptionSecret: string;
@@ -157,6 +184,22 @@ export class AuthService {
       });
     }
     this.accessTokenExpiresInSeconds = Math.floor(accessTokenTtlMs / 1000);
+    const oauthExchangeCodeExpiresIn = this.configService.get<StringValue>(
+      'OAUTH_EXCHANGE_CODE_EXPIRES_IN',
+      '60s' as StringValue,
+    );
+    const oauthExchangeCodeExpiresInMs = ms(oauthExchangeCodeExpiresIn);
+    if (
+      typeof oauthExchangeCodeExpiresInMs !== 'number' ||
+      !Number.isFinite(oauthExchangeCodeExpiresInMs) ||
+      oauthExchangeCodeExpiresInMs <= 0
+    ) {
+      throw new InternalServerErrorException({
+        code: 'CONFIG_INVALID',
+        message: 'Invalid OAUTH_EXCHANGE_CODE_EXPIRES_IN value',
+      });
+    }
+    this.oauthExchangeCodeExpiresInMs = oauthExchangeCodeExpiresInMs;
     this.twoFactorChallengeExpiresIn = this.configService.get<StringValue>(
       'TWO_FACTOR_CHALLENGE_EXPIRES_IN',
       '5m' as StringValue,
@@ -1619,6 +1662,63 @@ export class AuthService {
     };
   }
 
+  async createOauthExchangeCode(session: AuthSession): Promise<string> {
+    const code = this.generateOauthExchangeCode();
+    const codeHash = this.hashOauthExchangeCode(code);
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + this.oauthExchangeCodeExpiresInMs);
+
+    await this.prisma.oauthExchangeCode.create({
+      data: {
+        id: randomUUID(),
+        codeHash,
+        payloadJson: this.serializeOauthExchangePayload(session),
+        expiresAt,
+      },
+    });
+
+    return code;
+  }
+
+  async consumeOauthExchangeCode(rawCode: string): Promise<AuthSession> {
+    const oauthCode = String(rawCode || '').trim();
+    if (!oauthCode) {
+      throw new UnauthorizedException('OAuth exchange code is required');
+    }
+
+    const now = new Date();
+    const codeHash = this.hashOauthExchangeCode(oauthCode);
+    const payload = await this.prisma.$transaction(async (tx) => {
+      const row = await tx.oauthExchangeCode.findUnique({
+        where: { codeHash },
+      });
+      if (!row || row.expiresAt <= now || row.consumedAt) {
+        throw new UnauthorizedException('OAuth exchange code is invalid or expired');
+      }
+
+      const consumed = await tx.oauthExchangeCode.updateMany({
+        where: {
+          id: row.id,
+          consumedAt: null,
+          expiresAt: {
+            gt: now,
+          },
+        },
+        data: {
+          consumedAt: now,
+        },
+      });
+
+      if (consumed.count !== 1) {
+        throw new UnauthorizedException('OAuth exchange code is invalid or expired');
+      }
+
+      return row.payloadJson;
+    });
+
+    return this.deserializeOauthExchangePayload(payload as Prisma.JsonValue);
+  }
+
   private async issueTokens(
     tx: PrismaTx,
     user: User,
@@ -1860,6 +1960,168 @@ export class AuthService {
       createdAt: user.createdAt,
       updatedAt: user.updatedAt,
     };
+  }
+
+  private generateOauthExchangeCode(): string {
+    return randomBytes(32).toString('base64url');
+  }
+
+  private hashOauthExchangeCode(code: string): string {
+    return createHash('sha256').update(code).digest('hex');
+  }
+
+  private serializeOauthExchangePayload(
+    session: AuthSession,
+  ): Prisma.InputJsonValue {
+    return {
+      accessToken: session.accessToken,
+      expiresIn: session.expiresIn,
+      session: {
+        sid: session.session.sid,
+      },
+      user: {
+        id: session.user.id,
+        email: session.user.email,
+        status: session.user.status,
+        systemRole: session.user.systemRole,
+        firstName: session.user.firstName,
+        lastName: session.user.lastName,
+        displayName: session.user.displayName,
+        dob: session.user.dob ? session.user.dob.toISOString() : null,
+        address: session.user.address,
+        avatarUrl: session.user.avatarUrl,
+        timezone: session.user.timezone,
+        locale: session.user.locale,
+        fullName: session.user.fullName,
+        twoFactorEnabled: session.user.twoFactorEnabled,
+        createdAt: session.user.createdAt.toISOString(),
+        updatedAt: session.user.updatedAt.toISOString(),
+      },
+    };
+  }
+
+  private deserializeOauthExchangePayload(payload: Prisma.JsonValue): AuthSession {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      throw new UnauthorizedException('OAuth exchange payload is invalid');
+    }
+
+    const record = payload as Record<string, unknown>;
+    const accessToken =
+      typeof record.accessToken === 'string' ? record.accessToken.trim() : '';
+    const expiresIn = Number(record.expiresIn);
+    const sessionRecord =
+      record.session && typeof record.session === 'object' && !Array.isArray(record.session)
+        ? (record.session as Record<string, unknown>)
+        : {};
+    const sid = typeof sessionRecord.sid === 'string' ? sessionRecord.sid.trim() : '';
+    const user = this.deserializePublicUserFromOauthPayload(record.user);
+
+    if (
+      !accessToken ||
+      !Number.isFinite(expiresIn) ||
+      expiresIn <= 0 ||
+      !sid ||
+      !user
+    ) {
+      throw new UnauthorizedException('OAuth exchange payload is invalid');
+    }
+
+    return {
+      accessToken,
+      expiresIn: Math.floor(expiresIn),
+      session: { sid },
+      user,
+    };
+  }
+
+  private deserializePublicUserFromOauthPayload(input: unknown): PublicUser | null {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+      return null;
+    }
+
+    const record = input as Record<string, unknown>;
+    const id = typeof record.id === 'string' ? record.id.trim() : '';
+    const email = typeof record.email === 'string' ? record.email.trim() : '';
+    const status = this.toUserStatus(record.status);
+    const systemRole = this.toSystemRole(record.systemRole);
+    const createdAt = this.toDate(record.createdAt);
+    const updatedAt = this.toDate(record.updatedAt);
+
+    if (!id || !email || !status || !systemRole || !createdAt || !updatedAt) {
+      return null;
+    }
+
+    const dob = this.toNullableDate(record.dob);
+
+    return {
+      id,
+      email,
+      status,
+      systemRole,
+      firstName: this.toNullableString(record.firstName),
+      lastName: this.toNullableString(record.lastName),
+      displayName: this.toNullableString(record.displayName),
+      dob,
+      address: this.toNullableString(record.address),
+      avatarUrl: this.toNullableString(record.avatarUrl),
+      timezone: this.toNullableString(record.timezone),
+      locale: this.toNullableString(record.locale),
+      fullName: this.toNullableString(record.fullName),
+      twoFactorEnabled: record.twoFactorEnabled === true,
+      createdAt,
+      updatedAt,
+    };
+  }
+
+  private toNullableString(value: unknown): string | null {
+    if (typeof value !== 'string') {
+      return null;
+    }
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+
+  private toNullableDate(value: unknown): Date | null {
+    if (value === null || value === undefined || value === '') {
+      return null;
+    }
+    return this.toDate(value);
+  }
+
+  private toDate(value: unknown): Date | null {
+    if (typeof value !== 'string' && !(value instanceof Date)) {
+      return null;
+    }
+    const raw = value instanceof Date ? value.toISOString() : value;
+    const parsed = new Date(raw);
+    if (Number.isNaN(parsed.getTime())) {
+      return null;
+    }
+    return parsed;
+  }
+
+  private toUserStatus(value: unknown): UserStatus | null {
+    const normalized = String(value || '').trim().toUpperCase();
+    if (
+      normalized === UserStatus.ACTIVE ||
+      normalized === UserStatus.LOCKED ||
+      normalized === UserStatus.DISABLED
+    ) {
+      return normalized as UserStatus;
+    }
+    return null;
+  }
+
+  private toSystemRole(value: unknown): SystemRole | null {
+    const normalized = String(value || '').trim().toUpperCase();
+    if (
+      normalized === SystemRole.SUPER_ADMIN ||
+      normalized === SystemRole.SYSTEM_ADMIN ||
+      normalized === SystemRole.USER
+    ) {
+      return normalized as SystemRole;
+    }
+    return null;
   }
 
   private buildDisplayName(input: {

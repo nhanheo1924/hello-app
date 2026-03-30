@@ -17,7 +17,7 @@
             </div>
             <nav>
                 <ul class="nav-menu">
-                    <li class="nav-item" onclick="location.href='../home/'">
+                    <li class="nav-item" id="settingsBackToHomeNav" role="button" tabindex="0" aria-label="Back to My Workspaces">
                         <span class="nav-icon">&#9673;</span>My Workspaces
                         <span class="chevron">&#9662;</span>
                     </li>
@@ -412,7 +412,7 @@
                                 <img id="twoFactorQrImage" class="two-factor-qr" alt="2FA QR code" />
                                 <div class="card-sub">If QR is not available, use this secret:</div>
                                 <code id="twoFactorSecretText" class="two-factor-secret"></code>
-                                <input type="text" class="field-input two-factor-input" id="twoFactorConfirmOtpInput" placeholder="Enter 6-digit OTP to confirm" maxlength="6" inputmode="numeric" />
+                                <input type="text" class="field-input two-factor-input" id="twoFactorConfirmOtpInput" placeholder="Enter 6-digit OTP to confirm" maxlength="6" inputmode="numeric" autocomplete="off" />
                                 <button class="action-btn" id="twoFactorConfirmBtn">Confirm 2FA</button>
                                 <div id="twoFactorBackupCodesWrap" class="two-factor-backup hidden">
                                     <div class="card-sub">Save backup codes in a safe place (shown once):</div>
@@ -427,8 +427,8 @@
                                 <div class="card-sub">Provide OTP or backup code to disable.</div>
                             </div>
                             <div class="two-factor-disable-actions">
-                                <input type="text" class="field-input two-factor-input" id="twoFactorDisableOtpInput" placeholder="OTP (optional)" maxlength="6" inputmode="numeric" />
-                                <input type="text" class="field-input two-factor-input" id="twoFactorDisableBackupInput" placeholder="Backup code (optional)" />
+                                <input type="text" class="field-input two-factor-input" id="twoFactorDisableOtpInput" placeholder="OTP (optional)" maxlength="6" inputmode="numeric" autocomplete="off" />
+                                <input type="text" class="field-input two-factor-input" id="twoFactorDisableBackupInput" placeholder="Backup code (optional)" autocomplete="off" />
                                 <button class="action-btn danger" id="twoFactorDisableBtn">Disable 2FA</button>
                             </div>
                         </div>
@@ -442,11 +442,11 @@
                     <div class="card">
                         <div class="card-row password-grid-row">
                             <div class="password-change-fields">
-                                <input type="password" class="field-input" id="currentPasswordInput" placeholder="Current password" autocomplete="current-password" />
-                                <input type="password" class="field-input" id="newPasswordInput" placeholder="New password" autocomplete="new-password" />
-                                <input type="password" class="field-input" id="confirmNewPasswordInput" placeholder="Confirm new password" autocomplete="new-password" />
-                                <input type="text" class="field-input hidden" id="passwordOtpInput" placeholder="OTP (required when 2FA enabled)" maxlength="6" inputmode="numeric" />
-                                <input type="text" class="field-input hidden" id="passwordBackupCodeInput" placeholder="Backup code (optional when 2FA enabled)" />
+                                <input type="password" class="field-input" id="currentPasswordInput" placeholder="Current password" autocomplete="off" />
+                                <input type="password" class="field-input" id="newPasswordInput" placeholder="New password" autocomplete="off" />
+                                <input type="password" class="field-input" id="confirmNewPasswordInput" placeholder="Confirm new password" autocomplete="off" />
+                                <input type="text" class="field-input hidden" id="passwordOtpInput" placeholder="OTP (required when 2FA enabled)" maxlength="6" inputmode="numeric" autocomplete="off" />
+                                <input type="text" class="field-input hidden" id="passwordBackupCodeInput" placeholder="Backup code (optional when 2FA enabled)" autocomplete="off" />
                                 <button class="action-btn" id="changePasswordBtn" type="button">Change Password</button>
                                 <div id="passwordChangeMessage" class="two-factor-message" aria-live="polite"></div>
                             </div>

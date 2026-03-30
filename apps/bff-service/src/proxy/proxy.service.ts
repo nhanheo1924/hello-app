@@ -11,6 +11,16 @@ type ForwardOptions = {
   upstreamPath: string;
 };
 
+type ForwardPolicy = {
+  maxAttempts: number;
+  retryDelayMs: number;
+  timeoutMs: number;
+};
+
+type MutateAuthPayloadResult = {
+  buffer: Buffer<ArrayBuffer>;
+};
+
 const HOP_BY_HOP_HEADERS = new Set([
   'connection',
   'content-encoding',
@@ -37,6 +47,20 @@ const RETRYABLE_ERROR_CODES = new Set([
 ]);
 
 const ADMIN_USER_KEY = 'admin:*';
+const AUTH_CRITICAL_PATHS = new Set([
+  'login',
+  'signup',
+  'register',
+  '2fa/verify-login',
+  'password',
+]);
+const AUTH_SESSION_ISSUE_PATHS = new Set([
+  'login',
+  'signup',
+  'register',
+  '2fa/verify-login',
+  'oauth/exchange',
+]);
 
 @Injectable()
 export class ProxyService {
@@ -51,33 +75,31 @@ export class ProxyService {
     options: ForwardOptions,
   ): Promise<void> {
     const targetBaseUrl = this.resolveTargetBaseUrl(options.upstream);
+    const normalizedUpstreamPath = this.normalizeUpstreamPath(
+      options.upstreamPath,
+    );
     const upstreamUrl = this.buildUpstreamUrl(
       targetBaseUrl,
       options.upstreamPath,
       request,
     );
-    const maxAttempts = this.configService.get<number>(
-      'UPSTREAM_MAX_ATTEMPTS',
-      3,
+    const policy = this.resolveForwardPolicy(
+      options,
+      normalizedUpstreamPath,
     );
-    const retryDelayMs = this.configService.get<number>(
-      'UPSTREAM_RETRY_DELAY_MS',
-      400,
-    );
-    const timeoutMs = this.configService.get<number>('UPSTREAM_TIMEOUT_MS', 15000);
     const isSseRequest = this.isSseForwardRequest(request, options);
 
     const requestBody = this.buildRequestBody(request);
-    const headers = this.buildForwardHeaders(request);
+    const headers = this.buildForwardHeaders(request, options);
 
     let upstreamResponse: globalThis.Response | null = null;
     let lastError: unknown = null;
 
-    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    for (let attempt = 1; attempt <= policy.maxAttempts; attempt += 1) {
       const controller = new AbortController();
       const timeoutId =
-        !isSseRequest && timeoutMs > 0
-          ? setTimeout(() => controller.abort(), timeoutMs)
+        !isSseRequest && policy.timeoutMs > 0
+          ? setTimeout(() => controller.abort(), policy.timeoutMs)
           : null;
 
       try {
@@ -91,11 +113,13 @@ export class ProxyService {
         break;
       } catch (error) {
         lastError = error;
-        if (!this.isRetryableError(error) || attempt >= maxAttempts) {
+        if (!this.isRetryableError(error) || attempt >= policy.maxAttempts) {
           break;
         }
 
-        await this.sleep(retryDelayMs * attempt);
+        if (policy.retryDelayMs > 0) {
+          await this.sleep(policy.retryDelayMs * attempt);
+        }
       } finally {
         if (timeoutId) {
           clearTimeout(timeoutId);
@@ -129,7 +153,17 @@ export class ProxyService {
       return;
     }
 
-    const buffer = Buffer.from(await upstreamResponse.arrayBuffer());
+    let buffer = Buffer.from(await upstreamResponse.arrayBuffer());
+    if (options.upstream === 'auth') {
+      const handled = this.mutateAuthPayloadAndCookie({
+        request,
+        response,
+        normalizedUpstreamPath,
+        upstreamResponse,
+        buffer,
+      });
+      buffer = handled.buffer;
+    }
 
     if (this.shouldPublishInvalidate(request, options, upstreamResponse.status)) {
       const workspaceId = this.resolveWorkspaceIdHint(
@@ -257,6 +291,40 @@ export class ProxyService {
     return 'admin.security';
   }
 
+  private resolveForwardPolicy(
+    options: ForwardOptions,
+    normalizedUpstreamPath: string,
+  ): ForwardPolicy {
+    const defaultPolicy: ForwardPolicy = {
+      maxAttempts: this.configService.get<number>('UPSTREAM_MAX_ATTEMPTS', 3),
+      retryDelayMs: this.configService.get<number>('UPSTREAM_RETRY_DELAY_MS', 400),
+      timeoutMs: this.configService.get<number>('UPSTREAM_TIMEOUT_MS', 15000),
+    };
+
+    if (
+      options.upstream === 'auth' &&
+      AUTH_CRITICAL_PATHS.has(normalizedUpstreamPath)
+    ) {
+      return {
+        maxAttempts: 1,
+        retryDelayMs: 0,
+        timeoutMs: this.configService.get<number>(
+          'AUTH_CRITICAL_UPSTREAM_TIMEOUT_MS',
+          8000,
+        ),
+      };
+    }
+
+    return defaultPolicy;
+  }
+
+  private normalizeUpstreamPath(path: string): string {
+    return String(path || '')
+      .trim()
+      .replace(/^\/+|\/+$/g, '')
+      .toLowerCase();
+  }
+
   private resolveTargetBaseUrl(upstream: UpstreamType): string {
     if (upstream === 'auth') {
       return String(
@@ -298,7 +366,10 @@ export class ProxyService {
     return upstream.toString();
   }
 
-  private buildForwardHeaders(request: Request): Headers {
+  private buildForwardHeaders(
+    request: Request,
+    _options: ForwardOptions,
+  ): Headers {
     const headers = new Headers();
 
     for (const [name, value] of Object.entries(request.headers || {})) {
@@ -310,7 +381,8 @@ export class ProxyService {
       if (
         normalizedName === 'host' ||
         normalizedName === 'connection' ||
-        normalizedName === 'content-length'
+        normalizedName === 'content-length' ||
+        normalizedName === 'cookie'
       ) {
         continue;
       }
@@ -319,6 +391,13 @@ export class ProxyService {
         headers.set(name, value.join(', '));
       } else {
         headers.set(name, String(value));
+      }
+    }
+
+    if (!headers.has('authorization')) {
+      const tokenFromCookie = this.extractAccessTokenFromCookie(request);
+      if (tokenFromCookie) {
+        headers.set('authorization', `Bearer ${tokenFromCookie}`);
       }
     }
 
@@ -340,6 +419,150 @@ export class ProxyService {
     );
 
     return headers;
+  }
+
+  private mutateAuthPayloadAndCookie(input: {
+    request: Request;
+    response: Response;
+    normalizedUpstreamPath: string;
+    upstreamResponse: globalThis.Response;
+    buffer: Buffer;
+  }): MutateAuthPayloadResult {
+    const {
+      request,
+      response,
+      normalizedUpstreamPath,
+      upstreamResponse,
+      buffer,
+    } = input;
+    const baseBuffer = buffer as Buffer<ArrayBuffer>;
+
+    if (normalizedUpstreamPath === 'logout') {
+      this.clearAccessTokenCookie(response, request);
+      return { buffer: baseBuffer };
+    }
+
+    if (!AUTH_SESSION_ISSUE_PATHS.has(normalizedUpstreamPath)) {
+      return { buffer: baseBuffer };
+    }
+
+    const payload = this.tryParseJsonBody(upstreamResponse, buffer);
+    if (!payload) {
+      return { buffer: baseBuffer };
+    }
+
+    if (upstreamResponse.status < 200 || upstreamResponse.status >= 300) {
+      return { buffer: baseBuffer };
+    }
+
+    if (payload.requiresTwoFactor === true) {
+      this.clearAccessTokenCookie(response, request);
+      return { buffer: baseBuffer };
+    }
+
+    const accessToken =
+      typeof payload.accessToken === 'string' ? payload.accessToken.trim() : '';
+    if (!accessToken) {
+      return { buffer: baseBuffer };
+    }
+
+    const expiresInSeconds = Number(payload.expiresIn);
+    this.setAccessTokenCookie(response, request, accessToken, expiresInSeconds);
+
+    delete payload.accessToken;
+    return {
+      buffer: Buffer.from(JSON.stringify(payload)) as Buffer<ArrayBuffer>,
+    };
+  }
+
+  private extractAccessTokenFromCookie(request: Request): string {
+    const cookieName = this.getAccessTokenCookieName();
+    const cookies = request.cookies as Record<string, unknown> | undefined;
+    const token = cookies && typeof cookies[cookieName] === 'string'
+      ? String(cookies[cookieName]).trim()
+      : '';
+    return token;
+  }
+
+  private setAccessTokenCookie(
+    response: Response,
+    request: Request,
+    token: string,
+    expiresInSeconds: number,
+  ): void {
+    const maxAgeMs = Number.isFinite(expiresInSeconds) && expiresInSeconds > 0
+      ? Math.floor(expiresInSeconds * 1000)
+      : 60 * 60 * 1000;
+
+    response.cookie(
+      this.getAccessTokenCookieName(),
+      token,
+      {
+        ...this.getAccessTokenCookieBaseOptions(request),
+        maxAge: maxAgeMs,
+      },
+    );
+  }
+
+  private clearAccessTokenCookie(response: Response, request: Request): void {
+    response.clearCookie(
+      this.getAccessTokenCookieName(),
+      this.getAccessTokenCookieBaseOptions(request),
+    );
+  }
+
+  private getAccessTokenCookieName(): string {
+    const configured = String(
+      this.configService.get<string>('AUTH_ACCESS_COOKIE_NAME', 'ctm_at'),
+    ).trim();
+    return configured || 'ctm_at';
+  }
+
+  private getAccessTokenCookieBaseOptions(request: Request): {
+    httpOnly: true;
+    secure: boolean;
+    sameSite: 'lax' | 'strict' | 'none';
+    path: string;
+    domain?: string;
+  } {
+    const configuredSameSite = String(
+      this.configService.get<string>('AUTH_ACCESS_COOKIE_SAMESITE', 'strict'),
+    )
+      .trim()
+      .toLowerCase();
+    const sameSite: 'lax' | 'strict' | 'none' =
+      configuredSameSite === 'lax' || configuredSameSite === 'none'
+        ? configuredSameSite
+        : 'strict';
+    const nodeEnv = String(this.configService.get<string>('NODE_ENV', 'development')).trim();
+    const isHttpsRequest =
+      request.secure ||
+      String(request.headers['x-forwarded-proto'] || '')
+        .toLowerCase()
+        .includes('https');
+    const secure = nodeEnv === 'production' ? true : sameSite === 'none' && isHttpsRequest;
+    const effectiveSameSite: 'lax' | 'strict' | 'none' =
+      sameSite === 'none' && !secure ? 'strict' : sameSite;
+    const domain = String(
+      this.configService.get<string>('AUTH_ACCESS_COOKIE_DOMAIN', ''),
+    ).trim();
+
+    if (domain) {
+      return {
+        httpOnly: true,
+        secure,
+        sameSite: effectiveSameSite,
+        path: '/',
+        domain,
+      };
+    }
+
+    return {
+      httpOnly: true,
+      secure,
+      sameSite: effectiveSameSite,
+      path: '/',
+    };
   }
 
   private resolveWorkspaceIdHint(
