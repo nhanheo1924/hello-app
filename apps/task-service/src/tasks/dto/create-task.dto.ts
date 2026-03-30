@@ -1,12 +1,16 @@
-import { TaskPriority, TaskStatus } from "@prisma/client";
+﻿import { TaskPriority, TaskStatus } from "@prisma/client";
 import {
+  IsBoolean,
   IsEnum,
   IsISO8601,
+  IsInt,
   IsNotEmpty,
   IsOptional,
   IsString,
   IsUUID,
+  Max,
   MaxLength,
+  Min,
 } from "class-validator";
 
 export class CreateTaskDto {
@@ -30,11 +34,25 @@ export class CreateTaskDto {
 
   @IsOptional()
   @IsISO8601()
+  startAt?: string;
+
+  @IsOptional()
+  @IsISO8601()
   dueAt?: string;
 
   @IsOptional()
+  @IsBoolean()
+  allDay?: boolean;
+
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  @Max(100000)
+  estimatedMinutes?: number;
+
+  @IsOptional()
   @IsUUID()
-  assigneeId?: string;
+  assigneeUserId?: string;
 
   @IsOptional()
   @IsUUID()

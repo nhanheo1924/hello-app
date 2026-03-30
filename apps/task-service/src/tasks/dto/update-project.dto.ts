@@ -1,4 +1,4 @@
-import { ProjectStatus } from "@prisma/client";
+﻿import { ProjectStatus, ProjectViewType, ProjectVisibility } from "@prisma/client";
 import { IsEnum, IsOptional, IsString, MaxLength } from "class-validator";
 
 export class UpdateProjectDto {
@@ -15,4 +15,12 @@ export class UpdateProjectDto {
   @IsOptional()
   @IsEnum(ProjectStatus)
   status?: ProjectStatus;
+
+  @IsOptional()
+  @IsEnum(ProjectVisibility)
+  visibility?: ProjectVisibility;
+
+  @IsOptional()
+  @IsEnum(ProjectViewType)
+  defaultView?: ProjectViewType;
 }

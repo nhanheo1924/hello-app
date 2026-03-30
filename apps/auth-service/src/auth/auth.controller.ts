@@ -2,6 +2,8 @@ import {
   Body,
   Controller,
   Get,
+  Param,
+  Patch,
   Post,
   Query,
   Req,
@@ -22,15 +24,25 @@ import {
   TwoFactorChallengeResponse,
 } from './auth.service';
 import { ConfirmTwoFactorDto } from './dto/confirm-two-factor.dto';
+import { ChangePasswordDto } from './dto/change-password.dto';
 import { DisableTwoFactorDto } from './dto/disable-two-factor.dto';
 import { LoginDto } from './dto/login.dto';
+import {
+  AdminAuditLogsQueryDto,
+  AdminUsersQueryDto,
+} from './dto/admin-query.dto';
 import { RegisterDto } from './dto/register.dto';
+import { RevokeAdminSessionsDto } from './dto/revoke-admin-sessions.dto';
 import { RevokeSessionDto } from './dto/revoke-session.dto';
+import { UpdateAdminUserStatusDto } from './dto/update-admin-user-status.dto';
+import { UpdateAdminUserSystemRoleDto } from './dto/update-admin-user-system-role.dto';
+import { UpdateProfileDto } from './dto/update-profile.dto';
 import { VerifyTwoFactorLoginDto } from './dto/verify-two-factor-login.dto';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import type { PublicUser } from './interfaces/auth-response.interface';
 
 const GOOGLE_STATE_COOKIE_NAME = 'ctm_google_oauth_state';
+const GOOGLE_CALLBACK_COOKIE_NAME = 'ctm_google_oauth_callback';
 const TWO_FACTOR_CHALLENGE_COOKIE_NAME = 'ctm_2fa_challenge';
 
 @Controller('auth')
@@ -39,6 +51,8 @@ export class AuthController {
   private readonly twoFactorChallengeCookieOptions: CookieOptions;
   private readonly webAppUrl: string;
   private readonly webAppOauthCallbackUrl: string;
+  private readonly publicAuthBasePath: string;
+  private readonly allowedWebOrigins: Set<string>;
 
   constructor(
     private readonly authService: AuthService,
@@ -46,12 +60,15 @@ export class AuthController {
   ) {
     const secureCookies =
       this.configService.get<string>('NODE_ENV') === 'production';
+    this.publicAuthBasePath = this.normalizePublicAuthBasePath(
+      this.configService.get<string>('AUTH_PUBLIC_BASE_PATH', '/api/v1/auth'),
+    );
 
     this.googleStateCookieOptions = {
       httpOnly: true,
       secure: secureCookies,
       sameSite: 'lax',
-      path: '/api/auth/google',
+      path: `${this.publicAuthBasePath}/google`,
       maxAge: 10 * 60 * 1000,
     };
 
@@ -64,7 +81,7 @@ export class AuthController {
       httpOnly: true,
       secure: secureCookies,
       sameSite: 'lax',
-      path: '/api/auth/2fa',
+      path: `${this.publicAuthBasePath}/2fa`,
       maxAge:
         typeof challengeTtlMs === 'number' ? challengeTtlMs : 5 * 60 * 1000,
     };
@@ -76,6 +93,11 @@ export class AuthController {
     this.webAppOauthCallbackUrl = this.configService.get<string>(
       'WEB_APP_OAUTH_CALLBACK_URL',
       new URL('/auth/callback/', this.webAppUrl).toString(),
+    );
+    this.allowedWebOrigins = this.buildAllowedWebOrigins(
+      this.configService.get<string>('CORS_ORIGIN', ''),
+      this.webAppUrl,
+      this.webAppOauthCallbackUrl,
     );
   }
 
@@ -196,15 +218,32 @@ export class AuthController {
 
   // allow both /auth/google and /auth/google/start as entry points
   @Get(['google', 'google/start'])
-  googleStart(@Res() response: Response) {
+  googleStart(
+    @Query('callback') callback: string | undefined,
+    @Req() request: Request,
+    @Res() response: Response,
+  ) {
     try {
       const state = randomUUID();
       const url = this.authService.getGoogleAuthorizationUrl(state);
+      const callbackUrl = this.resolveRequestedOauthCallbackUrl(
+        callback,
+        request,
+      );
       response.cookie(
         GOOGLE_STATE_COOKIE_NAME,
         state,
         this.googleStateCookieOptions,
       );
+      if (callbackUrl) {
+        response.cookie(
+          GOOGLE_CALLBACK_COOKIE_NAME,
+          callbackUrl,
+          this.googleStateCookieOptions,
+        );
+      } else {
+        this.clearGoogleCallbackCookie(response);
+      }
       return response.redirect(url);
     } catch {
       return this.redirectToWeb(response, 'error', 'Google login unavailable');
@@ -222,13 +261,19 @@ export class AuthController {
       request,
       GOOGLE_STATE_COOKIE_NAME,
     );
+    const callbackUrlFromCookie = this.getCookieValue(
+      request,
+      GOOGLE_CALLBACK_COOKIE_NAME,
+    );
     this.clearGoogleStateCookie(response);
+    this.clearGoogleCallbackCookie(response);
 
     if (!code || !state || !stateFromCookie || state !== stateFromCookie) {
       return this.redirectToWeb(
         response,
         'error',
         'Invalid Google login state',
+        callbackUrlFromCookie,
       );
     }
 
@@ -240,16 +285,26 @@ export class AuthController {
 
       if (this.isTwoFactorChallenge(result)) {
         this.setTwoFactorChallengeCookie(response, result.twoFactorToken);
-        return this.redirectToWeb(response, '2fa');
+        return this.redirectToWeb(
+          response,
+          '2fa',
+          undefined,
+          callbackUrlFromCookie,
+        );
       }
 
       // successful login; send token back via query param for frontend to consume
-      const successUrl = this.buildWebOauthCallbackUrl();
+      const successUrl = this.buildWebOauthCallbackUrl(callbackUrlFromCookie);
       // redirect back to the sign‑in page with the token so frontend can pick it up
       successUrl.searchParams.set('token', result.accessToken);
       return response.redirect(successUrl.toString());
     } catch {
-      return this.redirectToWeb(response, 'error', 'Google login failed');
+      return this.redirectToWeb(
+        response,
+        'error',
+        'Google login failed',
+        callbackUrlFromCookie,
+      );
     }
   }
 
@@ -265,11 +320,126 @@ export class AuthController {
     };
   }
 
+  @UseGuards(JwtAuthGuard)
+  @Patch('profile')
+  async updateProfile(
+    @CurrentUser('userId') userId: string,
+    @Body() dto: UpdateProfileDto,
+  ) {
+    const user = await this.authService.updateProfile(userId, dto);
+    return {
+      user: this.toUserResponse(user),
+    };
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Patch('password')
+  changePassword(
+    @CurrentUser('userId') userId: string,
+    @Body() dto: ChangePasswordDto,
+    @Req() request: Request,
+  ) {
+    return this.authService.changePassword(
+      userId,
+      dto,
+      this.getSessionContext(request),
+    );
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Get('admin/dashboard/security')
+  adminSecurityDashboard(@CurrentUser('userId') userId: string) {
+    return this.authService.getAdminSecurityDashboard(userId);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Get('admin/users')
+  adminUsers(
+    @CurrentUser('userId') userId: string,
+    @Query() query: AdminUsersQueryDto,
+  ) {
+    return this.authService.listAdminUsers(userId, query);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Patch('admin/users/:userId/status')
+  adminUpdateUserStatus(
+    @CurrentUser('userId') actorUserId: string,
+    @Param('userId') targetUserId: string,
+    @Body() dto: UpdateAdminUserStatusDto,
+  ) {
+    return this.authService.updateAdminUserStatus(
+      actorUserId,
+      targetUserId,
+      dto.status,
+    );
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Patch('admin/users/:userId/system-role')
+  adminUpdateUserSystemRole(
+    @CurrentUser('userId') actorUserId: string,
+    @Param('userId') targetUserId: string,
+    @Body() dto: UpdateAdminUserSystemRoleDto,
+  ) {
+    return this.authService.updateAdminUserSystemRole(
+      actorUserId,
+      targetUserId,
+      dto.systemRole,
+    );
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Get('admin/users/:userId/sessions')
+  adminUserSessions(
+    @CurrentUser('userId') actorUserId: string,
+    @Param('userId') targetUserId: string,
+  ) {
+    return this.authService.listAdminUserSessions(actorUserId, targetUserId);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Post('admin/users/:userId/sessions/revoke')
+  adminRevokeUserSessions(
+    @CurrentUser('userId') actorUserId: string,
+    @Param('userId') targetUserId: string,
+    @Body() dto: RevokeAdminSessionsDto,
+  ) {
+    return this.authService.revokeAdminUserSessions(
+      actorUserId,
+      targetUserId,
+      dto.sessionId,
+    );
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Get('admin/audit-logs')
+  adminAuditLogs(
+    @CurrentUser('userId') userId: string,
+    @Query() query: AdminAuditLogsQueryDto,
+  ) {
+    return this.authService.listAdminAuditLogs(userId, query);
+  }
+
   private toAuthResponse(result: AuthSession): {
     accessToken: string;
     expiresIn: number;
     session: { sid: string };
-    user: { id: string; email: string; fullName: string | null };
+    user: {
+      id: string;
+      email: string;
+      systemRole: string;
+      firstName: string | null;
+      lastName: string | null;
+      displayName: string | null;
+      dob: Date | null;
+      address: string | null;
+      avatarUrl: string | null;
+      timezone: string | null;
+      locale: string | null;
+      fullName: string | null;
+      twoFactorEnabled: boolean;
+    };
   } {
     return {
       accessToken: result.accessToken,
@@ -282,12 +452,32 @@ export class AuthController {
   private toUserResponse(user: PublicUser): {
     id: string;
     email: string;
+    systemRole: string;
+    firstName: string | null;
+    lastName: string | null;
+    displayName: string | null;
+    dob: Date | null;
+    address: string | null;
+    avatarUrl: string | null;
+    timezone: string | null;
+    locale: string | null;
     fullName: string | null;
+    twoFactorEnabled: boolean;
   } {
     return {
       id: user.id,
       email: user.email,
+      systemRole: user.systemRole,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      displayName: user.displayName,
+      dob: user.dob,
+      address: user.address,
+      avatarUrl: user.avatarUrl,
+      timezone: user.timezone,
+      locale: user.locale,
       fullName: user.fullName,
+      twoFactorEnabled: user.twoFactorEnabled,
     };
   }
 
@@ -295,8 +485,9 @@ export class AuthController {
     response: Response,
     status: 'success' | 'error' | '2fa',
     message?: string,
+    callbackUrlOverride?: string,
   ) {
-    const url = this.buildWebOauthCallbackUrl();
+    const url = this.buildWebOauthCallbackUrl(callbackUrlOverride);
     url.searchParams.set('google', status);
     if (message) {
       url.searchParams.set('message', message);
@@ -304,8 +495,11 @@ export class AuthController {
     return response.redirect(url.toString());
   }
 
-  private buildWebOauthCallbackUrl(): URL {
-    return new URL(this.webAppOauthCallbackUrl);
+  private buildWebOauthCallbackUrl(callbackUrlOverride?: string): URL {
+    const normalizedOverride = this.normalizeOauthCallbackUrl(
+      callbackUrlOverride,
+    );
+    return new URL(normalizedOverride ?? this.webAppOauthCallbackUrl);
   }
 
   private getCookieValue(request: Request, key: string): string | undefined {
@@ -333,6 +527,15 @@ export class AuthController {
 
   private clearGoogleStateCookie(response: Response): void {
     response.clearCookie(GOOGLE_STATE_COOKIE_NAME, {
+      httpOnly: true,
+      sameSite: this.googleStateCookieOptions.sameSite,
+      secure: this.googleStateCookieOptions.secure,
+      path: this.googleStateCookieOptions.path,
+    });
+  }
+
+  private clearGoogleCallbackCookie(response: Response): void {
+    response.clearCookie(GOOGLE_CALLBACK_COOKIE_NAME, {
       httpOnly: true,
       sameSite: this.googleStateCookieOptions.sameSite,
       secure: this.googleStateCookieOptions.secure,
@@ -377,5 +580,121 @@ export class AuthController {
     result: LoginResult,
   ): result is TwoFactorChallengeResponse {
     return (result as TwoFactorChallengeResponse).requiresTwoFactor === true;
+  }
+
+  private resolveRequestedOauthCallbackUrl(
+    callback: string | undefined,
+    request: Request,
+  ): string | undefined {
+    const direct = this.normalizeOauthCallbackUrl(callback);
+    if (direct) {
+      return direct;
+    }
+
+    const requestOrigin = this.getRequestOrigin(request);
+    if (!requestOrigin) {
+      return undefined;
+    }
+
+    const derived = this.normalizeOauthCallbackUrl(
+      new URL('/auth/callback/', requestOrigin).toString(),
+    );
+    return derived ?? undefined;
+  }
+
+  private normalizeOauthCallbackUrl(value: string | undefined): string | null {
+    const raw = String(value || '').trim();
+    if (!raw) {
+      return null;
+    }
+
+    try {
+      const parsed = new URL(raw);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        return null;
+      }
+
+      if (!this.allowedWebOrigins.has(parsed.origin)) {
+        return null;
+      }
+
+      if (!parsed.pathname.startsWith('/auth/callback')) {
+        return null;
+      }
+
+      return parsed.toString();
+    } catch {
+      return null;
+    }
+  }
+
+  private getRequestOrigin(request: Request): string | null {
+    const originHeader = request.get('origin');
+    if (typeof originHeader === 'string' && originHeader.trim().length > 0) {
+      try {
+        return new URL(originHeader.trim()).origin;
+      } catch {
+        // ignore invalid origin header
+      }
+    }
+
+    const refererHeader = request.get('referer');
+    if (typeof refererHeader === 'string' && refererHeader.trim().length > 0) {
+      try {
+        return new URL(refererHeader.trim()).origin;
+      } catch {
+        // ignore invalid referer header
+      }
+    }
+
+    return null;
+  }
+
+  private buildAllowedWebOrigins(
+    corsOriginsValue: string,
+    webAppUrl: string,
+    webAppOauthCallbackUrl: string,
+  ): Set<string> {
+    const origins = new Set<string>();
+
+    const addOrigin = (value: string | undefined): void => {
+      const raw = String(value || '').trim();
+      if (!raw || raw === '*') {
+        return;
+      }
+
+      try {
+        const parsed = new URL(raw);
+        if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+          origins.add(parsed.origin);
+        }
+      } catch {
+        // ignore invalid URL values
+      }
+    };
+
+    addOrigin(webAppUrl);
+    addOrigin(webAppOauthCallbackUrl);
+
+    const corsOrigins = String(corsOriginsValue || '')
+      .split(',')
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0);
+
+    for (const origin of corsOrigins) {
+      addOrigin(origin);
+    }
+
+    return origins;
+  }
+
+  private normalizePublicAuthBasePath(value: string): string {
+    const trimmed = String(value || '').trim();
+    if (!trimmed) {
+      return '/api/v1/auth';
+    }
+
+    const withLeadingSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+    return withLeadingSlash.replace(/\/+$/, '');
   }
 }

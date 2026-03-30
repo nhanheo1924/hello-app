@@ -1,0 +1,81 @@
+html {
+    font-size: calc(17px * 1.18);
+}
+
+.auth-container {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+}
+
+.auth-card {
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 18px;
+    padding: 2rem;
+    width: 90%;
+    max-width: 600px;
+    text-align: center;
+}
+
+.auth-header {
+    margin-bottom: 1.5rem;
+}
+
+.mini-logo {
+    width: 150px;
+    margin-bottom: 1rem;
+}
+
+main {
+    padding: 1rem;
+    text-align: left;
+}
+
+section {
+    margin-bottom: 1.5rem;
+}
+
+h2 {
+    font-size: 1.2rem;
+    color: #fff;
+    border-bottom: 1px solid #444;
+    padding-bottom: 0.5rem;
+    margin-bottom: 1rem;
+}
+
+p {
+    color: #ccc;
+    line-height: 1.6;
+}
+
+a {
+    color: #fff;
+    text-decoration: none;
+}
+
+a:hover {
+    text-decoration: underline;
+}
+
+.auth-footer {
+    margin-top: 1.5rem;
+}
+
+/* Global font override */
+*, *::before, *::after {
+    font-family: "Times New Roman", Times, serif !important;
+}
+body {
+    background: #070708;
+    color: rgba(255,255,255,0.92);
+}
+
+.card,
+.about-card,
+.about-panel {
+    background: rgba(255,255,255,0.04);
+    border-color: rgba(255,255,255,0.12);
+    color: rgba(255,255,255,0.9);
+}

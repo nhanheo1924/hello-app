@@ -1,10 +1,19 @@
 param(
-  [string]$AuthApiBase = 'http://localhost:3000/api/auth',
-  [string]$TaskApiBase = 'http://localhost:3002/api'
+  [string]$BffApiBase = 'http://localhost:3001/api/v1',
+  [string]$AuthHealthUrl = 'http://localhost:3000/api/health/ready',
+  [string]$TaskHealthUrl = 'http://localhost:3102/api/health/ready',
+  [string]$CloudflareZaClientId = '',
+  [string]$CloudflareZaClientSecret = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+$zaHeaders = @{}
+if (-not [string]::IsNullOrWhiteSpace($CloudflareZaClientId) -and -not [string]::IsNullOrWhiteSpace($CloudflareZaClientSecret)) {
+  $zaHeaders['CF-Access-Client-Id'] = $CloudflareZaClientId
+  $zaHeaders['CF-Access-Client-Secret'] = $CloudflareZaClientSecret
+}
 
 function Invoke-JsonApi {
   param(
@@ -14,10 +23,18 @@ function Invoke-JsonApi {
     [object]$Body = $null
   )
 
+  $mergedHeaders = @{}
+  foreach ($entry in $zaHeaders.GetEnumerator()) {
+    $mergedHeaders[$entry.Key] = $entry.Value
+  }
+  foreach ($entry in $Headers.GetEnumerator()) {
+    $mergedHeaders[$entry.Key] = $entry.Value
+  }
+
   $requestParams = @{
     Method = $Method
     Uri = $Url
-    Headers = $Headers
+    Headers = $mergedHeaders
     ErrorAction = 'Stop'
   }
 
@@ -29,28 +46,27 @@ function Invoke-JsonApi {
   return Invoke-RestMethod @requestParams
 }
 
-$authServiceBase = [regex]::Replace($AuthApiBase, '/api/auth/?$', '')
-$taskServiceBase = [regex]::Replace($TaskApiBase, '/api/?$', '')
-
 Write-Host '1) Checking backend readiness...'
-$authReady = Invoke-JsonApi -Method 'GET' -Url "$authServiceBase/api/health/ready"
-$taskReady = Invoke-JsonApi -Method 'GET' -Url "$taskServiceBase/api/health/ready"
+$authReady = Invoke-JsonApi -Method 'GET' -Url $AuthHealthUrl
+$taskReady = Invoke-JsonApi -Method 'GET' -Url $TaskHealthUrl
+$bffReady = Invoke-JsonApi -Method 'GET' -Url "$BffApiBase/health/ready"
 Write-Host "   Auth: $($authReady.status)"
 Write-Host "   Task: $($taskReady.status)"
+Write-Host "   BFF : $($bffReady.status)"
 
 $emailSuffix = [Guid]::NewGuid().ToString('N').Substring(0, 8)
 $email = "local-$emailSuffix@example.com"
 $password = 'CtmLocal2026!'
 $fullName = 'Local Stack Verify'
 
-Write-Host '2) Registering and logging in test user...'
-$null = Invoke-JsonApi -Method 'POST' -Url "$AuthApiBase/signup" -Body @{
+Write-Host '2) Registering and logging in test user via BFF...'
+$null = Invoke-JsonApi -Method 'POST' -Url "$BffApiBase/auth/signup" -Body @{
   email = $email
   password = $password
   fullName = $fullName
 }
 
-$login = Invoke-JsonApi -Method 'POST' -Url "$AuthApiBase/login" -Body @{
+$login = Invoke-JsonApi -Method 'POST' -Url "$BffApiBase/auth/login" -Body @{
   email = $email
   password = $password
 }
@@ -62,26 +78,26 @@ if ([string]::IsNullOrWhiteSpace($token)) {
 
 $authHeaders = @{ Authorization = "Bearer $token" }
 
-Write-Host '3) Creating workspace/project/task via task-service...'
-$workspace = Invoke-JsonApi -Method 'POST' -Url "$TaskApiBase/workspaces" -Headers $authHeaders -Body @{ name = "Local Workspace $emailSuffix" }
+Write-Host '3) Creating workspace/project/task via BFF...'
+$workspace = Invoke-JsonApi -Method 'POST' -Url "$BffApiBase/workspaces" -Headers $authHeaders -Body @{ name = "Local Workspace $emailSuffix" }
 $workspaceId = [string]$workspace.data.id
 if ([string]::IsNullOrWhiteSpace($workspaceId)) {
   throw 'Workspace creation failed: missing workspace id.'
 }
 
-$project = Invoke-JsonApi -Method 'POST' -Url "$TaskApiBase/workspaces/$workspaceId/projects" -Headers $authHeaders -Body @{ name = "Local Project $emailSuffix"; description = 'Created by verify-local-stack.ps1' }
+$project = Invoke-JsonApi -Method 'POST' -Url "$BffApiBase/workspaces/$workspaceId/projects" -Headers $authHeaders -Body @{ name = "Local Project $emailSuffix"; description = 'Created by verify-local-stack.ps1' }
 $projectId = [string]$project.data.id
 if ([string]::IsNullOrWhiteSpace($projectId)) {
   throw 'Project creation failed: missing project id.'
 }
 
-$task = Invoke-JsonApi -Method 'POST' -Url "$TaskApiBase/projects/$projectId/tasks" -Headers $authHeaders -Body @{ title = "Verify Task $emailSuffix"; description = 'Persisted in Postgres'; priority = 'MEDIUM'; status = 'TODO' }
+$task = Invoke-JsonApi -Method 'POST' -Url "$BffApiBase/projects/$projectId/tasks" -Headers $authHeaders -Body @{ title = "Verify Task $emailSuffix"; description = 'Persisted in Postgres'; priority = 'MEDIUM'; status = 'TODO' }
 $taskId = [string]$task.data.id
 if ([string]::IsNullOrWhiteSpace($taskId)) {
   throw 'Task creation failed: missing task id.'
 }
 
-$board = Invoke-JsonApi -Method 'GET' -Url "$TaskApiBase/projects/$projectId/board" -Headers $authHeaders
+$board = Invoke-JsonApi -Method 'GET' -Url "$BffApiBase/projects/$projectId/board" -Headers $authHeaders
 $allTasks = @()
 if ($board.data -and $board.data.columns) {
   foreach ($column in $board.data.columns) {
@@ -100,6 +116,7 @@ Write-Host '4) Verification successful.'
 $result = [ordered]@{
   authHealth = $authReady.status
   taskHealth = $taskReady.status
+  bffHealth = $bffReady.status
   userEmail = $email
   workspaceId = $workspaceId
   projectId = $projectId

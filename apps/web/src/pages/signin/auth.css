@@ -1,0 +1,232 @@
+html {
+    font-size: 16px;
+}
+
+:root {
+    --auth-bg: #080809;
+    --auth-panel: rgba(255, 255, 255, 0.04);
+    --auth-line: rgba(255, 255, 255, 0.12);
+    --auth-text: rgba(255, 255, 255, 0.92);
+    --auth-muted: rgba(255, 255, 255, 0.62);
+    --auth-control-width: min(100%, clamp(240px, calc(60% + 20px), 340px));
+}
+
+.auth-container {
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 20px;
+    position: relative;
+    z-index: 10;
+}
+
+.auth-card {
+    width: min(100%, 480px);
+    padding: 2.5rem;
+    text-align: center;
+    border-radius: 24px;
+    border: 1px solid var(--auth-line);
+    background: linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.03));
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    box-shadow: 0 24px 72px rgba(0,0,0,0.48);
+}
+
+.mini-logo {
+    display: block;
+    width: 112px;
+    margin: 0 auto 1.25rem;
+    filter: grayscale(1) brightness(1.2);
+}
+
+.auth-header {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.auth-card h1,
+.auth-card h2 {
+    color: var(--auth-text);
+    margin: 0 0 8px;
+}
+
+.auth-card p {
+    margin: 0 0 1rem;
+}
+
+.auth-card p,
+.auth-footer,
+.social-divider span {
+    color: var(--auth-muted);
+}
+
+#auth-form {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.input-group {
+    width: 100%;
+    display: flex;
+    justify-content: center;
+    margin-bottom: 1rem;
+}
+
+.input-group input {
+    width: var(--auth-control-width);
+    padding: 0.95rem 1rem;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 14px;
+    color: var(--auth-text);
+    font-family: 'Inter', 'Segoe UI', Arial, sans-serif;
+    transition: border-color 0.18s ease, background 0.18s ease, box-shadow 0.18s ease;
+}
+
+.input-group input::placeholder {
+    color: rgba(255, 255, 255, 0.34);
+}
+
+.input-group input:focus {
+    outline: none;
+    background: rgba(255, 255, 255, 0.07);
+    border-color: rgba(255, 255, 255, 0.34);
+    box-shadow: 0 0 0 3px rgba(255,255,255,0.06);
+}
+
+.full-width {
+    width: var(--auth-control-width);
+    margin-left: auto;
+    margin-right: auto;
+    margin-top: 0.9rem;
+}
+
+.social-divider {
+    width: var(--auth-control-width);
+    margin: 0.95rem 0 0.8rem;
+    position: relative;
+    text-align: center;
+}
+
+.social-divider::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 50%;
+    height: 1px;
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.social-divider span {
+    position: relative;
+    display: inline-block;
+    padding: 0 10px;
+    background: #0b0b0c;
+    font-size: 0.72rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+}
+
+.google-auth-container {
+    width: var(--auth-control-width);
+    margin: 0 auto;
+    display: flex;
+    justify-content: center;
+    min-height: 44px;
+}
+
+.google-fallback-btn {
+    width: 100%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    border-radius: 14px;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--auth-text);
+    padding: 0.82rem 1rem;
+    font-size: 0.95rem;
+    cursor: pointer;
+}
+
+.google-fallback-btn:hover {
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.google-logo-icon {
+    width: 18px;
+    height: 18px;
+    display: block;
+    object-fit: contain;
+}
+
+.auth-footer {
+    margin-top: 1.5rem;
+    font-size: 0.88rem;
+    text-align: center;
+}
+
+.auth-footer a {
+    color: rgba(255, 255, 255, 0.94);
+    text-decoration: none;
+    font-weight: 600;
+    margin-left: 5px;
+}
+
+.auth-footer a:hover {
+    text-decoration: underline;
+}
+
+.btn.primary,
+.btn.secondary {
+    border-radius: 14px;
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    padding: 0.92rem 1rem;
+    cursor: pointer;
+    transition: transform 0.18s ease, background 0.18s ease, border-color 0.18s ease;
+    font-family: 'Inter', 'Segoe UI', Arial, sans-serif;
+}
+
+.btn.primary {
+    background: rgba(255,255,255,0.94);
+    color: #000;
+}
+
+.btn.primary:hover {
+    transform: translateY(-1px);
+    background: #fff;
+}
+
+.btn.secondary {
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--auth-text);
+}
+
+.btn.secondary:hover {
+    background: rgba(255, 255, 255, 0.08);
+}
+
+.error-message {
+    color: #e4b1b1;
+    font-size: 0.82rem;
+    width: var(--auth-control-width);
+    margin: 0.4rem auto 0.2rem;
+    text-align: center;
+}
+
+.hidden {
+    display: none !important;
+}
+
+.two-factor-container {
+    margin-top: 0.4rem;
+}
+
+*, *::before, *::after {
+    font-family: 'Inter', 'Segoe UI', Arial, sans-serif !important;
+}

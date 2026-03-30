@@ -12,7 +12,7 @@ npm run prisma:migrate:deploy
 npm run start:dev
 ```
 
-Default local URL: `http://localhost:3002/api`
+Default local URL: `http://localhost:3102/api`
 
 ## Local Requirements
 
@@ -34,6 +34,6 @@ Default local URL: `http://localhost:3002/api`
 
 ## Security
 
-- Normal client mode: `Authorization: Bearer <access-token>`
+- Browser clients should call `bff-service` (`/api/v1/*`) instead of task-service directly.
 - Trusted proxy mode: `x-proxy-secret: <INTERNAL_PROXY_SECRET>`
 - Token is validated by JWKS (`RS256`, required claims: `sub`, `sid`, valid `iss`/`aud`).

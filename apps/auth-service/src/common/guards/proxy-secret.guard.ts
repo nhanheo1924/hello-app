@@ -18,7 +18,6 @@ export class ProxySecretGuard implements CanActivate {
     '/health/ready',
     '/api/health/ready',
   ]);
-  private static readonly publicPrefixes = ['/auth', '/api/auth'];
 
   constructor(private readonly configService: ConfigService) {}
 
@@ -51,13 +50,7 @@ export class ProxySecretGuard implements CanActivate {
       return false;
     }
 
-    if (ProxySecretGuard.publicPaths.has(path)) {
-      return true;
-    }
-
-    return ProxySecretGuard.publicPrefixes.some((prefix) =>
-      path.startsWith(prefix),
-    );
+    return ProxySecretGuard.publicPaths.has(path);
   }
 
   private getSingleHeaderValue(

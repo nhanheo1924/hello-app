@@ -33,5 +33,7 @@ Default local URL: `http://localhost:3000/api`
 
 ## Notes
 
+- In BFF mode, browser clients should use `bff-service` (`/api/v1/auth/*`) instead of calling auth-service directly.
+- Business endpoints are protected by `x-proxy-secret`; only health/JWKS are public.
 - Access-token-only session model (no refresh endpoint).
 - `GET /api/auth/me` returns `user` with `id`, `email`, `fullName`.

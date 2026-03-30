@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hello - Workspaces</title>
+    <link rel="stylesheet" href="../src/pages/home/project.css" />
+</head>
+<body class="stars-bg">
+    <div class="star-field" id="starField"></div>
+
+    <div class="app">
+        <button type="button" class="sidebar-overlay" id="sidebarOverlay" aria-label="Close sidebar"></button>
+        <aside class="sidebar">
+            <div class="logo">
+                <img src="../Resources/Logo.png" alt="Hello logo">
+            </div>
+            <button type="button" class="sidebar-toggle-btn" id="sidebarToggleBtn" aria-label="Toggle sidebar">
+                <span class="sidebar-toggle-icon">&#9776;</span>
+            </button>
+            <nav>
+                <ul class="nav-menu">
+                    <li class="nav-item active">
+                        <span class="nav-icon">&#9673;</span>My Workspaces
+                        <span class="chevron">&#9662;</span>
+                    </li>
+                    <ul class="sub-menu open" id="projectList">
+                        <li class="add-project" id="addProjectTrigger">
+                            <span class="plus-icon">+</span> New Workspace
+                        </li>
+                    </ul>
+                </ul>
+            </nav>
+            <div class="sidebar-footer">
+                <div class="profile-version">Orbit v2.0</div>
+            </div>
+        </aside>
+
+        <main class="content">
+            <header class="content-header">
+                <div class="header-left">
+                    <button type="button" class="mobile-sidebar-open-btn" id="mobileSidebarOpenBtn" aria-label="Open sidebar">
+                        &#9776;
+                    </button>
+                    <div class="breadcrumb">WORKSPACE</div>
+                    <h1 id="projectName">Workspace Nebula</h1>
+                </div>
+                <div class="header-right">
+                    <div class="view-switch" role="tablist" aria-label="Task view mode">
+                        <button type="button" class="view-btn active icon-view-btn" id="timelineViewBtn" data-view="timeline" aria-pressed="true" aria-label="Timeline view">&#9638;</button>
+                        <button type="button" class="view-btn icon-view-btn" id="boardViewBtn" data-view="board" aria-pressed="false" aria-label="Board view">&#9776;</button>
+                    </div>
+                    <div class="board-filters">
+                        <input type="text" id="taskSearchInput" placeholder="Search tasks..." aria-label="Search tasks" />
+                        <select id="taskStatusFilter" aria-label="Filter by status">
+                            <option value="All">All Statuses</option>
+                            <option value="Not Started">Not Started</option>
+                            <option value="In Progress">In Progress</option>
+                            <option value="Done">Done</option>
+                            <option value="Dropped">Dropped</option>
+                        </select>
+                        <select id="taskMemberFilter" aria-label="Filter by member">
+                            <option value="All">All Members</option>
+                        </select>
+                    </div>
+                </div>
+            </header>
+
+            <div class="timeline-wrapper">
+                <div class="timeline-container">
+                    <div class="timeline-ruler">
+                        <div class="spacer">
+                            <span class="spacer-label">TIMELINE</span>
+                        </div>
+                        <div class="hours-scale" id="hoursScale"></div>
+                    </div>
+                    <div class="days-grid" id="daysGrid"></div>
+                </div>
+            </div>
+
+            <div class="kanban-wrapper" id="kanbanWrapper" hidden>
+                <div class="kanban-container" id="kanbanContainer"></div>
+            </div>
+        </main>
+    </div>
+
+    <div id="taskModal" class="modal-overlay">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="modalTitle">New Task</h2>
+                <div class="modal-close" id="cancelBtn">&times;</div>
+            </div>
+            <div class="input-group">
+                <label for="taskInput">Task Name</label>
+                <input type="text" id="taskInput" placeholder="Enter task name..." required maxlength="120" />
+            </div>
+            <div class="input-group">
+                <label for="taskStartAtInput">Start</label>
+                <input type="datetime-local" id="taskStartAtInput" />
+            </div>
+            <div class="input-group">
+                <label for="taskEndAtInput">End</label>
+                <input type="datetime-local" id="taskEndAtInput" />
+            </div>
+            <div class="input-group">
+                <label for="taskStatusSelect">Status</label>
+                <select id="taskStatusSelect">
+                    <option value="Not Started">Not Started</option>
+                    <option value="In Progress">In Progress</option>
+                    <option value="Done">Done</option>
+                    <option value="Dropped">Dropped</option>
+                </select>
+            </div>
+            <div class="input-group">
+                <label for="taskPrioritySelect">Priority</label>
+                <select id="taskPrioritySelect">
+                    <option value="Low">Low</option>
+                    <option value="Medium" selected>Medium</option>
+                    <option value="High">High</option>
+                </select>
+            </div>
+            <div class="input-group">
+                <label for="taskNote">Notes</label>
+                <textarea id="taskNote" placeholder="Optional notes..."></textarea>
+            </div>
+            <div class="input-group">
+                <label for="taskImageUrl">Image URL</label>
+                <div class="file-input-wrapper">
+                    <input type="text" id="taskImageUrl" placeholder="https://..." />
+                    <label for="taskImageFile" class="file-input-label">Choose File</label>
+                    <input type="file" id="taskImageFile" accept="image/*" class="file-input-hidden" />
+                </div>
+            </div>
+            <div class="input-group">
+                <label for="taskMembersSelect">Assign to</label>
+                <select id="taskMembersSelect"></select>
+            </div>
+            <div class="modal-actions">
+                <button id="deleteBtn" class="danger">Delete Task</button>
+                <button id="abortBtn">Abort</button>
+                <button id="confirmBtn">Confirm</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="contextMenu" class="context-menu">
+        <div class="menu-item" id="menuEdit">
+            <span class="menu-icon">&#9998;</span> Edit Task
+        </div>
+        <div class="menu-divider"></div>
+        <div class="menu-item" id="menuStatusNotStarted">Set: Not Started</div>
+        <div class="menu-item" id="menuStatusInProgress">Set: In Progress</div>
+        <div class="menu-item" id="menuStatusDone">Set: Done</div>
+        <div class="menu-item" id="menuStatusDropped">Set: Dropped</div>
+        <div class="menu-divider"></div>
+        <div class="menu-item danger" id="menuDelete">
+            <span class="menu-icon">&#8855;</span> Delete Task
+        </div>
+    </div>
+
+    <div id="customConfirmModal" class="modal-overlay">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="customConfirmTitle"></h2>
+                <div class="modal-close" id="customConfirmClose">&times;</div>
+            </div>
+            <p id="customConfirmMessage"></p>
+            <div class="modal-actions">
+                <button id="customConfirmCancel">Cancel</button>
+                <button id="customConfirmOk">OK</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="workspaceSettingsModal" class="modal-overlay">
+        <div class="modal-content workspace-settings-modal-content">
+            <div class="modal-header">
+                <h2 id="workspaceSettingsModalTitle">Workspace Settings</h2>
+                <div class="modal-close" id="workspaceSettingsCloseBtn">&times;</div>
+            </div>
+            <div class="input-group">
+                <label for="workspaceNameInput">Workspace Name</label>
+                <input type="text" id="workspaceNameInput" maxlength="80" placeholder="Workspace name" />
+            </div>
+            <div class="input-group">
+                <label for="workspaceStartDateInput">Start Date</label>
+                <input type="date" id="workspaceStartDateInput" />
+            </div>
+            <div class="input-group">
+                <label for="workspaceEndDateInput">End Date</label>
+                <input type="date" id="workspaceEndDateInput" />
+            </div>
+            <div class="input-group">
+                <label for="workspaceHourFormatSelect">Hour Format</label>
+                <select id="workspaceHourFormatSelect">
+                    <option value="24">24h</option>
+                    <option value="12">12h</option>
+                </select>
+            </div>
+            <div class="input-group workspace-checkbox-row">
+                <label for="workspaceShowWeekendsInput">Show Weekends</label>
+                <input type="checkbox" id="workspaceShowWeekendsInput" checked />
+            </div>
+            <div class="input-group">
+                <label for="workspaceWeekStartSelect">Start of Week</label>
+                <select id="workspaceWeekStartSelect">
+                    <option value="mon">Monday</option>
+                    <option value="sun">Sunday</option>
+                </select>
+            </div>
+            <div class="input-group">
+                <label for="workspaceDefaultDurationInput">Default Task Duration (Hours)</label>
+                <input type="number" id="workspaceDefaultDurationInput" min="0.5" max="12" step="0.5" value="2" />
+            </div>
+            <p class="workspace-settings-note" id="workspaceSettingsHint">
+                Configure workspace timeline and basic board behavior.
+            </p>
+            <div class="modal-actions">
+                <button id="workspaceSettingsDeleteBtn" class="danger" hidden>Delete Workspace</button>
+                <button id="workspaceSettingsCancelBtn">Cancel</button>
+                <button id="workspaceSettingsSaveBtn">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <script type="module" src="../src/pages/home/main.ts"></script>
+</body>
+</html>

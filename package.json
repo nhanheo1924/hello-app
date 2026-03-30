@@ -3,15 +3,22 @@
   "private": true,
   "version": "1.0.0",
   "scripts": {
-    "install:all": "npm --prefix apps/auth-service install && npm --prefix apps/task-service install && npm --prefix apps/web install",
+    "install:all": "npm --prefix apps/auth-service install && npm --prefix apps/task-service install && npm --prefix apps/bff-service install && npm --prefix apps/web install",
     "env:sync": "powershell -ExecutionPolicy Bypass -File ./scripts/sync-local-env.ps1",
+    "tunnel:config": "powershell -ExecutionPolicy Bypass -File ./scripts/configure-cloudflared-env.ps1",
     "db:generate": "npm --prefix apps/auth-service run prisma:generate && npm --prefix apps/task-service run prisma:generate",
     "db:migrate": "powershell -ExecutionPolicy Bypass -File ./scripts/db-setup-local.ps1",
     "dev:auth": "npm --prefix apps/auth-service run start:dev",
     "dev:task": "npm --prefix apps/task-service run start:dev",
+    "dev:bff": "npm --prefix apps/bff-service run start:dev",
     "dev:web": "npm --prefix apps/web run dev",
-    "build": "npm --prefix apps/auth-service run build && npm --prefix apps/task-service run build && npm --prefix apps/web run build",
+    "dev:all": "powershell -ExecutionPolicy Bypass -File ./scripts/start-dev-all.ps1",
+    "dev:all:stop": "powershell -ExecutionPolicy Bypass -File ./scripts/stop-dev-all.ps1",
+    "build": "npm --prefix apps/auth-service run build && npm --prefix apps/task-service run build && npm --prefix apps/bff-service run build && npm --prefix apps/web run build",
     "verify:stack": "powershell -ExecutionPolicy Bypass -File ./scripts/verify-local-stack.ps1",
-    "verify:local": "powershell -ExecutionPolicy Bypass -File ./scripts/run-local-verify.ps1"
+    "verify:auth": "powershell -ExecutionPolicy Bypass -File ./scripts/verify-auth-flows.ps1",
+    "seed:admin:test": "powershell -ExecutionPolicy Bypass -File ./scripts/seed-admin-test.ps1",
+    "verify:local": "powershell -ExecutionPolicy Bypass -File ./scripts/run-local-verify.ps1",
+    "verify:local:tunnel": "powershell -ExecutionPolicy Bypass -File ./scripts/run-local-verify.ps1 -UseCloudflaredTunnel"
   }
 }

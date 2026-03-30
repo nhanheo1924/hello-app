@@ -27,38 +27,54 @@ export class TasksController {
   @Post("projects/:projectId/tasks")
   createTask(
     @CurrentUser("userId") userId: string,
+    @CurrentUser("systemRole") systemRole: string | undefined,
     @Param("projectId") projectId: string,
     @Body() dto: CreateTaskDto,
   ) {
-    return this.tasksService.createTask(userId, projectId, dto);
+    return this.tasksService.createTask(userId, systemRole, projectId, dto);
   }
 
   @Patch("tasks/:taskId")
   updateTask(
     @CurrentUser("userId") userId: string,
+    @CurrentUser("systemRole") systemRole: string | undefined,
     @Param("taskId") taskId: string,
     @Body() dto: UpdateTaskDto,
     @Headers("idempotency-key") idempotencyKey?: string,
   ) {
-    return this.tasksService.updateTask(userId, taskId, dto, idempotencyKey);
+    return this.tasksService.updateTask(
+      userId,
+      systemRole,
+      taskId,
+      dto,
+      idempotencyKey,
+    );
   }
 
   @Delete("tasks/:taskId")
   deleteTask(
     @CurrentUser("userId") userId: string,
+    @CurrentUser("systemRole") systemRole: string | undefined,
     @Param("taskId") taskId: string,
   ) {
-    return this.tasksService.deleteTask(userId, taskId);
+    return this.tasksService.deleteTask(userId, systemRole, taskId);
   }
 
   @Post("tasks/:taskId/move")
   moveTask(
     @CurrentUser("userId") userId: string,
+    @CurrentUser("systemRole") systemRole: string | undefined,
     @Param("taskId") taskId: string,
     @Body() dto: MoveTaskDto,
     @Headers("idempotency-key") idempotencyKey?: string,
   ) {
-    return this.tasksService.moveTask(userId, taskId, dto, idempotencyKey);
+    return this.tasksService.moveTask(
+      userId,
+      systemRole,
+      taskId,
+      dto,
+      idempotencyKey,
+    );
   }
 
   @Get("tasks/:taskId/comments")

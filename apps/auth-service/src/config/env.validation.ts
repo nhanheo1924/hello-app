@@ -49,6 +49,7 @@ export const envValidationSchema = Joi.object({
       then: Joi.required(),
       otherwise: Joi.string().min(32).default(devDefaultProxySecret),
     }),
+  AUTH_PUBLIC_BASE_PATH: Joi.string().default('/api/v1/auth'),
   WEB_APP_URL: Joi.string().uri().default('http://localhost:5173'),
   WEB_APP_OAUTH_CALLBACK_URL: Joi.string()
     .uri()

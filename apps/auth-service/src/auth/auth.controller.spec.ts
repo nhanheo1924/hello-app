@@ -21,6 +21,14 @@ describe('AuthController', () => {
     getGoogleAuthorizationUrl: jest.fn(),
     loginWithGoogleAuthCode: jest.fn(),
     getProfile: jest.fn(),
+    updateProfile: jest.fn(),
+    getAdminSecurityDashboard: jest.fn(),
+    listAdminUsers: jest.fn(),
+    updateAdminUserStatus: jest.fn(),
+    updateAdminUserSystemRole: jest.fn(),
+    listAdminUserSessions: jest.fn(),
+    revokeAdminUserSessions: jest.fn(),
+    listAdminAuditLogs: jest.fn(),
   };
 
   const configServiceMock = {
@@ -51,7 +59,17 @@ describe('AuthController', () => {
       id: 'u1',
       email: 'user@example.com',
       status: 'ACTIVE',
+      systemRole: 'USER',
+      firstName: 'User',
+      lastName: null,
+      displayName: 'User',
+      dob: null,
+      address: null,
+      avatarUrl: null,
+      timezone: null,
+      locale: null,
       fullName: 'User',
+      twoFactorEnabled: false,
       createdAt: new Date('2026-03-01T00:00:00.000Z'),
       updatedAt: new Date('2026-03-01T00:00:00.000Z'),
     };
@@ -95,11 +113,11 @@ describe('AuthController', () => {
       accessToken: 'access-token',
       expiresIn: 900,
       session: { sid: 'sid-1' },
-      user: {
+      user: expect.objectContaining({
         id: 'u1',
         email: 'user@example.com',
         fullName: 'User',
-      },
+      }),
     });
   });
 
@@ -110,5 +128,65 @@ describe('AuthController', () => {
 
     expect(authServiceMock.logout).toHaveBeenCalledWith('user-1', 'sid-1');
     expect(result).toEqual({ success: true });
+  });
+
+  it('admin users should delegate query to service', async () => {
+    authServiceMock.listAdminUsers.mockResolvedValue({
+      data: [{ id: 'u1', email: 'a@example.com' }],
+      meta: { page: 1, limit: 20, total: 1, totalPages: 1 },
+    });
+
+    const query = {
+      page: 1,
+      limit: 20,
+      q: 'a@',
+    };
+    const result = await controller.adminUsers('admin-1', query as any);
+
+    expect(authServiceMock.listAdminUsers).toHaveBeenCalledWith('admin-1', query);
+    expect(result).toEqual({
+      data: [{ id: 'u1', email: 'a@example.com' }],
+      meta: { page: 1, limit: 20, total: 1, totalPages: 1 },
+    });
+  });
+
+  it('admin update user status should call service with dto status', async () => {
+    authServiceMock.updateAdminUserStatus.mockResolvedValue({
+      data: { id: 'u2', status: 'LOCKED' },
+    });
+
+    const result = await controller.adminUpdateUserStatus(
+      'admin-1',
+      'u2',
+      { status: 'LOCKED' } as any,
+    );
+
+    expect(authServiceMock.updateAdminUserStatus).toHaveBeenCalledWith(
+      'admin-1',
+      'u2',
+      'LOCKED',
+    );
+    expect(result).toEqual({
+      data: { id: 'u2', status: 'LOCKED' },
+    });
+  });
+
+  it('admin revoke user sessions should pass optional session id', async () => {
+    authServiceMock.revokeAdminUserSessions.mockResolvedValue({
+      data: { revoked: 1 },
+    });
+
+    const result = await controller.adminRevokeUserSessions(
+      'admin-1',
+      'u2',
+      { sessionId: 'sid-2' } as any,
+    );
+
+    expect(authServiceMock.revokeAdminUserSessions).toHaveBeenCalledWith(
+      'admin-1',
+      'u2',
+      'sid-2',
+    );
+    expect(result).toEqual({ data: { revoked: 1 } });
   });
 });

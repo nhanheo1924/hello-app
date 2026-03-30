@@ -38,11 +38,28 @@ enum AuditAction {
   @@map("audit_action")
 }
 
+enum SystemRole {
+  SUPER_ADMIN
+  SYSTEM_ADMIN
+  USER
+
+  @@map("system_role")
+}
+
 model User {
   id                   String       @id @default(uuid()) @db.Uuid
   email                String       @unique
   passwordHash         String       @map("password_hash")
   status               UserStatus   @default(ACTIVE)
+  systemRole           SystemRole   @default(USER) @map("system_role")
+  firstName            String?      @map("first_name") @db.VarChar(120)
+  lastName             String?      @map("last_name") @db.VarChar(120)
+  displayName          String?      @map("display_name") @db.VarChar(120)
+  dob                  DateTime?    @db.Date
+  address              String?      @db.VarChar(255)
+  avatarUrl            String?      @map("avatar_url") @db.VarChar(512)
+  timezone             String?      @db.VarChar(64)
+  locale               String?      @db.VarChar(16)
   emailVerifiedAt      DateTime?    @map("email_verified_at")
   lastLoginAt          DateTime?    @map("last_login_at")
   fullName             String?      @map("full_name")
@@ -56,6 +73,7 @@ model User {
   sessions             Session[]
   auditLogs            AuditLog[]
 
+  @@index([status, systemRole], map: "users_status_system_role_idx")
   @@map("users")
 }
 

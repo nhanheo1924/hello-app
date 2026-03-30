@@ -16,11 +16,49 @@ enum WorkspaceRole {
   @@map("workspace_role")
 }
 
+enum MembershipStatus {
+  ACTIVE
+  INVITED
+  REMOVED
+
+  @@map("membership_status")
+}
+
+enum WorkspaceStatus {
+  ACTIVE
+  ARCHIVED
+
+  @@map("workspace_status")
+}
+
 enum ProjectStatus {
   ACTIVE
   ARCHIVED
 
   @@map("project_status")
+}
+
+enum ProjectVisibility {
+  PRIVATE
+  WORKSPACE
+
+  @@map("project_visibility")
+}
+
+enum ProjectViewType {
+  BOARD
+  CALENDAR
+
+  @@map("project_view_type")
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  REVOKED
+  EXPIRED
+
+  @@map("invitation_status")
 }
 
 enum TaskPriority {
@@ -41,27 +79,54 @@ enum TaskStatus {
   @@map("task_status")
 }
 
-model Workspace {
-  id         String            @id @default(uuid()) @db.Uuid
-  name       String
-  ownerId    String            @map("owner_id") @db.Uuid
-  createdAt  DateTime          @default(now()) @map("created_at")
-  updatedAt  DateTime          @updatedAt @map("updated_at")
-  members    WorkspaceMember[]
-  projects   Project[]
-  labels     Label[]
-  activities Activity[]
+enum NotificationType {
+  TASK_ASSIGNED
+  TASK_DUE_SOON
+  TASK_OVERDUE
+  COMMENT_ADDED
+  PROJECT_INVITATION
+  ROLE_CHANGED
+  PROJECT_ARCHIVED
 
-  @@index([ownerId])
+  @@map("notification_type")
+}
+
+enum SavedViewType {
+  BOARD
+  CALENDAR
+  LIST
+
+  @@map("saved_view_type")
+}
+
+model Workspace {
+  id           String            @id @default(uuid()) @db.Uuid
+  name         String
+  ownerUserId  String            @map("owner_user_id") @db.Uuid
+  status       WorkspaceStatus   @default(ACTIVE)
+  createdAt    DateTime          @default(now()) @map("created_at")
+  updatedAt    DateTime          @updatedAt @map("updated_at")
+  members      WorkspaceMember[]
+  projects     Project[]
+  labels       Label[]
+  activities   Activity[]
+  notifications Notification[]
+  savedViews    SavedView[]
+  templates     ProjectTemplate[]
+
+  @@index([ownerUserId])
+  @@index([status])
   @@map("workspaces")
 }
 
 model WorkspaceMember {
-  workspaceId String        @map("workspace_id") @db.Uuid
-  userId      String        @map("user_id") @db.Uuid
-  role        WorkspaceRole @default(MEMBER)
-  joinedAt    DateTime      @default(now()) @map("joined_at")
-  workspace   Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  workspaceId      String           @map("workspace_id") @db.Uuid
+  userId           String           @map("user_id") @db.Uuid
+  role             WorkspaceRole    @default(MEMBER)
+  status           MembershipStatus @default(ACTIVE)
+  invitedByUserId  String?          @map("invited_by_user_id") @db.Uuid
+  joinedAt         DateTime         @default(now()) @map("joined_at")
+  workspace        Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
 
   @@id([workspaceId, userId])
   @@index([userId])
@@ -70,36 +135,89 @@ model WorkspaceMember {
 }
 
 model Project {
-  id          String          @id @default(uuid()) @db.Uuid
-  workspaceId String          @map("workspace_id") @db.Uuid
-  name        String
-  description String?
-  status      ProjectStatus   @default(ACTIVE)
-  createdBy   String          @map("created_by") @db.Uuid
-  createdAt   DateTime        @default(now()) @map("created_at")
-  updatedAt   DateTime        @updatedAt @map("updated_at")
-  workspace   Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  columns     TaskColumn[]
-  tasks       Task[]
-  members     ProjectMember[]
-  activities  Activity[]
+  id               String             @id @default(uuid()) @db.Uuid
+  workspaceId      String             @map("workspace_id") @db.Uuid
+  ownerUserId      String             @map("owner_user_id") @db.Uuid
+  name             String
+  description      String?
+  status           ProjectStatus      @default(ACTIVE)
+  visibility       ProjectVisibility  @default(PRIVATE)
+  defaultView      ProjectViewType    @default(BOARD) @map("default_view")
+  color            String?
+  icon             String?
+  startDate        DateTime?          @map("start_date") @db.Date
+  endDate          DateTime?          @map("end_date") @db.Date
+  createdByUserId  String             @map("created_by_user_id") @db.Uuid
+  updatedByUserId  String?            @map("updated_by_user_id") @db.Uuid
+  archivedAt       DateTime?          @map("archived_at")
+  createdAt        DateTime           @default(now()) @map("created_at")
+  updatedAt        DateTime           @updatedAt @map("updated_at")
+  workspace        Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  columns          TaskColumn[]
+  tasks            Task[]
+  members          ProjectMember[]
+  invitations      ProjectInvitation[]
+  settings         ProjectSetting?
+  activities       Activity[]
+  notifications    Notification[]
 
   @@index([workspaceId])
   @@index([status])
+  @@index([visibility])
+  @@index([ownerUserId])
   @@map("projects")
 }
 
 model ProjectMember {
-  projectId String        @map("project_id") @db.Uuid
-  userId    String        @map("user_id") @db.Uuid
-  role      WorkspaceRole @default(MEMBER)
-  joinedAt  DateTime      @default(now()) @map("joined_at")
-  project   Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId         String           @map("project_id") @db.Uuid
+  userId            String           @map("user_id") @db.Uuid
+  role              WorkspaceRole    @default(MEMBER)
+  status            MembershipStatus @default(ACTIVE)
+  invitedByUserId   String?          @map("invited_by_user_id") @db.Uuid
+  joinedAt          DateTime         @default(now()) @map("joined_at")
+  project           Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   @@id([projectId, userId])
   @@index([userId])
   @@index([projectId, role])
   @@map("project_members")
+}
+
+model ProjectInvitation {
+  id               String           @id @default(uuid()) @db.Uuid
+  projectId        String           @map("project_id") @db.Uuid
+  email            String
+  role             WorkspaceRole
+  invitedByUserId  String           @map("invited_by_user_id") @db.Uuid
+  token            String           @unique
+  status           InvitationStatus @default(PENDING)
+  expiresAt        DateTime         @map("expires_at")
+  acceptedAt       DateTime?        @map("accepted_at")
+  createdAt        DateTime         @default(now()) @map("created_at")
+  updatedAt        DateTime         @updatedAt @map("updated_at")
+  project          Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, status])
+  @@index([email])
+  @@map("project_invitations")
+}
+
+model ProjectSetting {
+  projectId                String          @id @map("project_id") @db.Uuid
+  defaultView              ProjectViewType @default(BOARD) @map("default_view")
+  allowMemberInvite        Boolean         @default(false) @map("allow_member_invite")
+  allowComment             Boolean         @default(true) @map("allow_comment")
+  allowViewerComment       Boolean         @default(false) @map("allow_viewer_comment")
+  allowTaskReorder         Boolean         @default(true) @map("allow_task_reorder")
+  allowTaskDeleteByMember  Boolean         @default(false) @map("allow_task_delete_by_member")
+  taskPrefix               String?         @map("task_prefix") @db.VarChar(20)
+  themeColor               String?         @map("theme_color") @db.VarChar(32)
+  isPrivateByDefault       Boolean         @default(true) @map("is_private_by_default")
+  createdAt                DateTime        @default(now()) @map("created_at")
+  updatedAt                DateTime        @updatedAt @map("updated_at")
+  project                  Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@map("project_settings")
 }
 
 model TaskColumn {
@@ -117,44 +235,51 @@ model TaskColumn {
 }
 
 model Task {
-  id          String      @id @default(uuid()) @db.Uuid
-  projectId   String      @map("project_id") @db.Uuid
-  columnId    String      @map("column_id") @db.Uuid
-  title       String
-  description String?
-  priority    TaskPriority @default(MEDIUM)
-  status      TaskStatus   @default(TODO)
-  dueAt       DateTime?    @map("due_at")
-  assigneeId  String?      @map("assignee_id") @db.Uuid
-  orderIndex  Int          @default(0) @map("order_index")
-  createdBy   String       @map("created_by") @db.Uuid
-  archivedAt  DateTime?    @map("archived_at")
-  createdAt   DateTime     @default(now()) @map("created_at")
-  updatedAt   DateTime     @updatedAt @map("updated_at")
-  project     Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  column      TaskColumn   @relation(fields: [columnId], references: [id], onDelete: Cascade)
-  comments    TaskComment[]
-  taskLabels  TaskLabel[]
-  activities  Activity[]
+  id                String       @id @default(uuid()) @db.Uuid
+  projectId         String       @map("project_id") @db.Uuid
+  columnId          String?      @map("column_id") @db.Uuid
+  title             String
+  description       String?
+  priority          TaskPriority @default(MEDIUM)
+  status            TaskStatus   @default(TODO)
+  startAt           DateTime?    @map("start_at")
+  dueAt             DateTime?    @map("due_at")
+  allDay            Boolean      @default(false) @map("all_day")
+  estimatedMinutes  Int?         @map("estimated_minutes")
+  completedAt       DateTime?    @map("completed_at")
+  completedByUserId String?      @map("completed_by_user_id") @db.Uuid
+  assigneeUserId    String?      @map("assignee_user_id") @db.Uuid
+  orderIndex        Int          @default(0) @map("order_index")
+  createdByUserId   String       @map("created_by_user_id") @db.Uuid
+  archivedAt        DateTime?    @map("archived_at")
+  createdAt         DateTime     @default(now()) @map("created_at")
+  updatedAt         DateTime     @updatedAt @map("updated_at")
+  project           Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  column            TaskColumn?  @relation(fields: [columnId], references: [id], onDelete: SetNull)
+  comments          TaskComment[]
+  taskLabels        TaskLabel[]
+  activities        Activity[]
+  notifications     Notification[]
 
   @@index([projectId, columnId, orderIndex])
-  @@index([assigneeId])
+  @@index([assigneeUserId])
   @@index([status])
   @@index([dueAt])
+  @@index([startAt, dueAt])
   @@map("tasks")
 }
 
 model TaskComment {
-  id        String   @id @default(uuid()) @db.Uuid
-  taskId    String   @map("task_id") @db.Uuid
-  authorId  String   @map("author_id") @db.Uuid
-  content   String
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
-  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  id           String   @id @default(uuid()) @db.Uuid
+  taskId       String   @map("task_id") @db.Uuid
+  authorUserId String   @map("author_user_id") @db.Uuid
+  content      String
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+  task         Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
 
   @@index([taskId, createdAt])
-  @@index([authorId])
+  @@index([authorUserId])
   @@map("comments")
 }
 
@@ -174,11 +299,11 @@ model Label {
 }
 
 model TaskLabel {
-  taskId    String @map("task_id") @db.Uuid
-  labelId   String @map("label_id") @db.Uuid
+  taskId    String   @map("task_id") @db.Uuid
+  labelId   String   @map("label_id") @db.Uuid
   createdAt DateTime @default(now()) @map("created_at")
-  task      Task   @relation(fields: [taskId], references: [id], onDelete: Cascade)
-  label     Label  @relation(fields: [labelId], references: [id], onDelete: Cascade)
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  label     Label    @relation(fields: [labelId], references: [id], onDelete: Cascade)
 
   @@id([taskId, labelId])
   @@index([labelId])
@@ -190,7 +315,7 @@ model Activity {
   workspaceId String    @map("workspace_id") @db.Uuid
   projectId   String?   @map("project_id") @db.Uuid
   taskId      String?   @map("task_id") @db.Uuid
-  actorId     String    @map("actor_id") @db.Uuid
+  actorUserId String    @map("actor_user_id") @db.Uuid
   action      String
   entityType  String    @map("entity_type")
   entityId    String    @map("entity_id")
@@ -203,7 +328,32 @@ model Activity {
   @@index([workspaceId, createdAt])
   @@index([projectId, createdAt])
   @@index([taskId, createdAt])
+  @@index([actorUserId, createdAt])
   @@map("activities")
+}
+
+model Notification {
+  id               String           @id @default(uuid()) @db.Uuid
+  recipientUserId  String           @map("recipient_user_id") @db.Uuid
+  actorUserId      String?          @map("actor_user_id") @db.Uuid
+  workspaceId      String?          @map("workspace_id") @db.Uuid
+  projectId        String?          @map("project_id") @db.Uuid
+  taskId           String?          @map("task_id") @db.Uuid
+  type             NotificationType
+  title            String
+  body             String?
+  payload          Json?
+  isRead           Boolean          @default(false) @map("is_read")
+  readAt           DateTime?        @map("read_at")
+  createdAt        DateTime         @default(now()) @map("created_at")
+  workspace        Workspace?       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  project          Project?         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  task             Task?            @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([recipientUserId, isRead, createdAt])
+  @@index([projectId, createdAt])
+  @@index([taskId, createdAt])
+  @@map("notifications")
 }
 
 model IdempotencyRecord {
@@ -218,4 +368,83 @@ model IdempotencyRecord {
   @@unique([key, userId, action])
   @@index([createdAt])
   @@map("idempotency_records")
+}
+
+model SavedView {
+  id          String        @id @default(uuid()) @db.Uuid
+  workspaceId String        @map("workspace_id") @db.Uuid
+  ownerUserId String        @map("owner_user_id") @db.Uuid
+  name        String        @db.VarChar(120)
+  viewType    SavedViewType @default(BOARD) @map("view_type")
+  filters     Json?
+  sort        Json?
+  isDefault   Boolean       @default(false) @map("is_default")
+  createdAt   DateTime      @default(now()) @map("created_at")
+  updatedAt   DateTime      @updatedAt @map("updated_at")
+  workspace   Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, ownerUserId])
+  @@index([workspaceId, viewType])
+  @@map("saved_views")
+}
+
+model ProjectTemplate {
+  id              String                 @id @default(uuid()) @db.Uuid
+  workspaceId     String                 @map("workspace_id") @db.Uuid
+  createdByUserId String                 @map("created_by_user_id") @db.Uuid
+  name            String                 @db.VarChar(120)
+  description     String?
+  createdAt       DateTime               @default(now()) @map("created_at")
+  updatedAt       DateTime               @updatedAt @map("updated_at")
+  workspace       Workspace              @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  columns         ProjectTemplateColumn[]
+  labels          ProjectTemplateLabel[]
+  settings        ProjectTemplateSetting?
+
+  @@index([workspaceId, createdAt])
+  @@map("project_templates")
+}
+
+model ProjectTemplateColumn {
+  id         String          @id @default(uuid()) @db.Uuid
+  templateId String          @map("template_id") @db.Uuid
+  name       String          @db.VarChar(120)
+  position   Int
+  createdAt  DateTime        @default(now()) @map("created_at")
+  updatedAt  DateTime        @updatedAt @map("updated_at")
+  template   ProjectTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@index([templateId, position])
+  @@map("project_template_columns")
+}
+
+model ProjectTemplateLabel {
+  id         String          @id @default(uuid()) @db.Uuid
+  templateId String          @map("template_id") @db.Uuid
+  name       String          @db.VarChar(80)
+  color      String          @db.VarChar(32)
+  createdAt  DateTime        @default(now()) @map("created_at")
+  updatedAt  DateTime        @updatedAt @map("updated_at")
+  template   ProjectTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@index([templateId, name])
+  @@map("project_template_labels")
+}
+
+model ProjectTemplateSetting {
+  templateId               String          @id @map("template_id") @db.Uuid
+  defaultView              ProjectViewType @default(BOARD) @map("default_view")
+  allowMemberInvite        Boolean         @default(false) @map("allow_member_invite")
+  allowComment             Boolean         @default(true) @map("allow_comment")
+  allowViewerComment       Boolean         @default(false) @map("allow_viewer_comment")
+  allowTaskReorder         Boolean         @default(true) @map("allow_task_reorder")
+  allowTaskDeleteByMember  Boolean         @default(false) @map("allow_task_delete_by_member")
+  taskPrefix               String?         @map("task_prefix") @db.VarChar(20)
+  themeColor               String?         @map("theme_color") @db.VarChar(32)
+  isPrivateByDefault       Boolean         @default(true) @map("is_private_by_default")
+  createdAt                DateTime        @default(now()) @map("created_at")
+  updatedAt                DateTime        @updatedAt @map("updated_at")
+  template                 ProjectTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@map("project_template_settings")
 }

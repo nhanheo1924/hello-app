@@ -7,7 +7,10 @@ export class UsersService {
   constructor(private readonly prisma: PrismaService) {}
 
   create(
-    data: Pick<Prisma.UserCreateInput, 'email' | 'passwordHash' | 'fullName'>,
+    data: Pick<
+      Prisma.UserCreateInput,
+      'email' | 'passwordHash' | 'fullName' | 'displayName' | 'firstName' | 'lastName'
+    >,
   ): Promise<User> {
     return this.prisma.user.create({ data });
   }
@@ -18,6 +21,20 @@ export class UsersService {
 
   findByEmail(email: string): Promise<User | null> {
     return this.prisma.user.findUnique({ where: { email } });
+  }
+
+  findByIds(ids: string[]): Promise<User[]> {
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return Promise.resolve([]);
+    }
+
+    return this.prisma.user.findMany({
+      where: {
+        id: {
+          in: ids,
+        },
+      },
+    });
   }
 
   findByGoogleId(googleId: string): Promise<User | null> {

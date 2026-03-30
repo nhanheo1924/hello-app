@@ -9,7 +9,7 @@ export const envValidationSchema = Joi.object({
     .valid("development", "test", "production")
     .default("development"),
   APP_HOST: Joi.string().default("0.0.0.0"),
-  APP_PORT: Joi.number().port().default(3002),
+  APP_PORT: Joi.number().port().default(3102),
   APP_PREFIX: Joi.string().default("api"),
   CORS_ORIGIN: Joi.string().allow("").default("http://localhost:5173"),
   DATABASE_URL: Joi.string().when("NODE_ENV", {
@@ -19,6 +19,12 @@ export const envValidationSchema = Joi.object({
   }),
   JWT_ISSUER: Joi.string().uri().default("http://localhost:3000"),
   JWT_AUDIENCE: Joi.string().default("ctm-web"),
+  AUTH_SERVICE_BASE_URL: Joi.string()
+    .uri()
+    .default("http://localhost:3000/api/auth"),
+  AUTH_SERVICE_INTERNAL_BASE_URL: Joi.string()
+    .uri()
+    .default("http://localhost:3000/api/internal"),
   AUTH_JWKS_URL: Joi.string()
     .uri()
     .default("http://localhost:3000/.well-known/jwks.json"),

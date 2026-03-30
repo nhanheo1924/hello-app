@@ -25,12 +25,6 @@ export class ProxySecretGuard implements CanActivate {
       return true;
     }
 
-    // Browser clients can call task-service directly with bearer token.
-    // Route-level JwtAuthGuard still performs signature/claim verification.
-    if (this.hasBearerAuthorization(request.headers.authorization)) {
-      return true;
-    }
-
     const expectedSecret = this.configService.get<string>(
       "INTERNAL_PROXY_SECRET",
     );
@@ -75,15 +69,5 @@ export class ProxySecretGuard implements CanActivate {
     }
 
     return timingSafeEqual(expectedBuffer, providedBuffer);
-  }
-
-  private hasBearerAuthorization(
-    value: string | string[] | undefined,
-  ): boolean {
-    const headerValue = this.getSingleHeaderValue(value);
-    if (!headerValue) {
-      return false;
-    }
-    return /^Bearer\s+\S+$/i.test(headerValue.trim());
   }
 }

@@ -37,6 +37,11 @@ type AuthResponseBody = {
   session: {
     sid: string;
   };
+  user?: {
+    email?: string;
+    systemRole?: string;
+    displayName?: string | null;
+  };
 };
 
 type SessionsResponseBody = {
@@ -54,6 +59,30 @@ describe('Auth requirements (e2e)', () => {
   let app: INestApplication<App>;
   const prisma = new PrismaClient();
 
+  async function ensureProfileColumns(): Promise<void> {
+    await prisma.$executeRawUnsafe(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'system_role') THEN
+          CREATE TYPE system_role AS ENUM ('SUPER_ADMIN', 'SYSTEM_ADMIN', 'USER');
+        END IF;
+      END $$;
+    `);
+
+    await prisma.$executeRawUnsafe(`
+      ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS system_role system_role NOT NULL DEFAULT 'USER',
+        ADD COLUMN IF NOT EXISTS first_name VARCHAR(120),
+        ADD COLUMN IF NOT EXISTS last_name VARCHAR(120),
+        ADD COLUMN IF NOT EXISTS display_name VARCHAR(120),
+        ADD COLUMN IF NOT EXISTS dob DATE,
+        ADD COLUMN IF NOT EXISTS address VARCHAR(255),
+        ADD COLUMN IF NOT EXISTS avatar_url VARCHAR(512),
+        ADD COLUMN IF NOT EXISTS timezone VARCHAR(64),
+        ADD COLUMN IF NOT EXISTS locale VARCHAR(16);
+    `);
+  }
+
   beforeAll(async () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
       imports: [AppModule],
@@ -61,6 +90,7 @@ describe('Auth requirements (e2e)', () => {
 
     app = moduleFixture.createNestApplication();
     await app.init();
+    await ensureProfileColumns();
   });
 
   beforeEach(async () => {
@@ -95,7 +125,7 @@ describe('Auth requirements (e2e)', () => {
     const register = await request(app.getHttpServer())
       .post('/auth/signup')
       .set(proxyHeader)
-      .send({ email, password })
+      .send({ email, password, firstName: 'Test' })
       .expect(201);
     const registerBody = register.body as AuthResponseBody;
     expect(typeof registerBody.accessToken).toBe('string');
@@ -113,7 +143,37 @@ describe('Auth requirements (e2e)', () => {
       .get('/auth/me')
       .set(proxyHeader)
       .set('Authorization', `Bearer ${access1}`)
-      .expect(200);
+      .expect(200)
+      .expect((response) => {
+        expect(response.body.user.email).toBe(email);
+        expect(response.body.user.systemRole).toBe('USER');
+      });
+
+    await request(app.getHttpServer())
+      .patch('/auth/profile')
+      .set(proxyHeader)
+      .set('Authorization', `Bearer ${access1}`)
+      .send({
+        firstName: 'Test',
+        lastName: 'User',
+        displayName: 'Test User',
+        timezone: 'Asia/Ho_Chi_Minh',
+        locale: 'vi',
+      })
+      .expect(200)
+      .expect((response) => {
+        expect(response.body.user.displayName).toBe('Test User');
+        expect(response.body.user.firstName).toBe('Test');
+      });
+
+    await request(app.getHttpServer())
+      .get('/internal/users/by-email')
+      .set(proxyHeader)
+      .query({ email })
+      .expect(200)
+      .expect((response) => {
+        expect(response.body.user.email).toBe(email);
+      });
 
     const sessions1 = await request(app.getHttpServer())
       .get('/auth/sessions')
@@ -167,5 +227,12 @@ describe('Auth requirements (e2e)', () => {
         const body = response.body as ErrorResponseBody;
         expect(body.code).toBe('SESSION_REVOKED');
       });
+  });
+
+  it('should block internal lookup endpoint without proxy secret', async () => {
+    await request(app.getHttpServer())
+      .get('/internal/users/by-email')
+      .query({ email: 'nobody@example.com' })
+      .expect(401);
   });
 });

@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hello - Admin</title>
+  <link rel="stylesheet" href="../src/pages/admin/admin.css" />
+</head>
+<body>
+  <main class="admin-shell">
+    <header class="admin-head">
+      <div>
+        <p class="admin-kicker">SYSTEM GOVERNANCE</p>
+        <h1>Admin Console</h1>
+      </div>
+      <div class="admin-head-actions">
+        <span class="realtime-chip" id="realtimeStatus" data-status="offline">Realtime: Offline</span>
+        <a class="btn ghost" href="../home/">Back to Home</a>
+        <button type="button" class="btn" id="refreshBtn">Refresh</button>
+      </div>
+    </header>
+
+    <section class="card" id="securityCard">
+      <h2>Security Dashboard</h2>
+      <div class="metric-grid" id="securityMetrics">
+        <div class="metric">Loading...</div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Realtime Events</h2>
+        <p class="muted">Latest updates from server</p>
+      </div>
+      <ul class="event-feed" id="realtimeEventsFeed">
+        <li class="event-feed-empty">Waiting for realtime events...</li>
+      </ul>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>User Management</h2>
+        <div class="filters">
+          <input id="userSearchInput" placeholder="Search by email/name" />
+          <select id="userStatusFilter">
+            <option value="">All Status</option>
+            <option value="ACTIVE">ACTIVE</option>
+            <option value="LOCKED">LOCKED</option>
+            <option value="DISABLED">DISABLED</option>
+          </select>
+          <select id="userRoleFilter">
+            <option value="">All Roles</option>
+            <option value="USER">USER</option>
+            <option value="SYSTEM_ADMIN">SYSTEM_ADMIN</option>
+            <option value="SUPER_ADMIN">SUPER_ADMIN</option>
+          </select>
+          <button class="btn" id="applyUserFilterBtn" type="button">Apply</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Email</th>
+              <th>Status</th>
+              <th>System Role</th>
+              <th>2FA</th>
+              <th>Last Login</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="usersTableBody">
+            <tr><td colspan="6">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Audit Explorer</h2>
+        <div class="filters">
+          <input id="auditActionInput" placeholder="Action (e.g LOGIN_FAIL)" />
+          <input id="auditEmailInput" placeholder="Email contains" />
+          <button class="btn" id="applyAuditFilterBtn" type="button">Apply</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Action</th>
+              <th>User</th>
+              <th>Email</th>
+              <th>IP</th>
+              <th>Detail</th>
+            </tr>
+          </thead>
+          <tbody id="auditTableBody">
+            <tr><td colspan="6">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Reporting Export</h2>
+        <div class="filters">
+          <input id="reportWorkspaceId" placeholder="Workspace ID" />
+          <input id="reportFrom" type="date" />
+          <input id="reportTo" type="date" />
+          <select id="reportType">
+            <option value="summary">summary</option>
+            <option value="tasks">tasks</option>
+            <option value="activity">activity</option>
+          </select>
+          <button class="btn" id="exportReportBtn" type="button">Export CSV</button>
+        </div>
+      </div>
+      <p id="reportStatus" class="muted">Enter workspace id then click export.</p>
+    </section>
+  </main>
+
+  <script type="module" src="../src/pages/admin/main.ts"></script>
+</body>
+</html>
+

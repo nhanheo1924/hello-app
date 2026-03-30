@@ -1,4 +1,4 @@
-import { TaskStatus } from "@prisma/client";
+﻿import { TaskStatus } from "@prisma/client";
 import {
   IsEnum,
   IsISO8601,
@@ -15,7 +15,7 @@ export class BoardQueryDto {
 
   @IsOptional()
   @IsUUID()
-  assigneeId?: string;
+  assigneeUserId?: string;
 
   @IsOptional()
   @IsISO8601()

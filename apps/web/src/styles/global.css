@@ -1,0 +1,21 @@
+/* Global variables and generic CSS reset for Hello */
+:root {
+  --color-bg: #000000;
+  --color-fg: #ffffff;
+  --color-muted: #bdbdbd;
+  --font-primary: 'Inter', sans-serif;
+  --font-display: 'Playfair Display', serif;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-primary);
+  background-color: var(--color-bg);
+  color: var(--color-fg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}

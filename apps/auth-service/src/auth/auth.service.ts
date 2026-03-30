@@ -1,10 +1,12 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   HttpException,
   HttpStatus,
   Injectable,
   InternalServerErrorException,
+  NotFoundException,
   ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
@@ -14,6 +16,7 @@ import {
   AuditAction,
   Prisma,
   SessionRevokeReason,
+  SystemRole,
   User,
   UserStatus,
 } from '@prisma/client';
@@ -31,8 +34,10 @@ import QRCode from 'qrcode';
 import { PrismaService } from '../prisma/prisma.service';
 import { UsersService } from '../users/users.service';
 import { DisableTwoFactorDto } from './dto/disable-two-factor.dto';
+import { ChangePasswordDto } from './dto/change-password.dto';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
+import { UpdateProfileDto } from './dto/update-profile.dto';
 import { VerifyTwoFactorLoginDto } from './dto/verify-two-factor-login.dto';
 import { JwtKeyService } from './jwt-key.service';
 import { AuthResponse, PublicUser } from './interfaces/auth-response.interface';
@@ -63,7 +68,30 @@ interface SessionContext {
   deviceId?: string | null;
 }
 
+interface AdminUsersQuery {
+  page?: number;
+  limit?: number;
+  q?: string;
+  status?: UserStatus;
+  systemRole?: SystemRole;
+}
+
+interface AdminAuditLogsQuery {
+  page?: number;
+  limit?: number;
+  userId?: string;
+  action?: string;
+  email?: string;
+  from?: string;
+  to?: string;
+}
+
 type PrismaTx = Prisma.TransactionClient;
+
+const SYSTEM_ADMIN_ROLES = new Set<SystemRole>([
+  SystemRole.SUPER_ADMIN,
+  SystemRole.SYSTEM_ADMIN,
+]);
 
 export interface SessionView {
   id: string;
@@ -178,12 +206,38 @@ export class AuthService {
     const passwordHash = await argon2.hash(dto.password, {
       type: argon2.argon2id,
     });
+    const firstName =
+      this.normalizeNullableText(dto.firstName, 120) ??
+      this.normalizeNullableText(dto.fullName, 120);
+    if (!firstName) {
+      throw new BadRequestException({
+        code: 'VALIDATION_ERROR',
+        message: 'firstName is required',
+      });
+    }
+    const lastName = this.normalizeNullableText(dto.lastName, 120);
+    const fullName =
+      this.normalizeNullableText(
+        [firstName, lastName].filter(Boolean).join(' '),
+        120,
+      ) ?? this.normalizeNullableText(dto.fullName, 120);
+
     const created = await this.prisma.$transaction(async (tx) => {
       const user = await tx.user.create({
         data: {
           email: normalizedEmail,
           passwordHash,
-          fullName: dto.fullName?.trim() || null,
+          firstName,
+          lastName,
+          fullName,
+          displayName: this.buildDisplayName(
+            {
+              firstName,
+              lastName,
+              fullName,
+              email: normalizedEmail,
+            },
+          ),
           status: UserStatus.ACTIVE,
         },
       });
@@ -577,6 +631,176 @@ export class AuthService {
     return this.toPublicUser(user);
   }
 
+  async updateProfile(
+    userId: string,
+    dto: UpdateProfileDto,
+  ): Promise<PublicUser> {
+    const existing = await this.usersService.findById(userId);
+    if (!existing) {
+      throw new UnauthorizedException({
+        code: 'USER_NOT_FOUND',
+        message: 'User does not exist',
+      });
+    }
+
+    const updateData: Prisma.UserUpdateInput = {};
+    const nextFirstName =
+      dto.firstName !== undefined
+        ? this.normalizeNullableText(dto.firstName, 120)
+        : existing.firstName;
+    const nextLastName =
+      dto.lastName !== undefined
+        ? this.normalizeNullableText(dto.lastName, 120)
+        : existing.lastName;
+    const normalizedFullNameInput =
+      dto.fullName !== undefined
+        ? this.normalizeNullableText(dto.fullName, 120)
+        : undefined;
+
+    if (dto.firstName !== undefined) {
+      updateData.firstName = nextFirstName;
+    }
+    if (dto.lastName !== undefined) {
+      updateData.lastName = nextLastName;
+    }
+    if (dto.displayName !== undefined) {
+      updateData.displayName = this.normalizeNullableText(dto.displayName, 120);
+    }
+    if (dto.fullName !== undefined) {
+      updateData.fullName = normalizedFullNameInput;
+    } else if (dto.firstName !== undefined || dto.lastName !== undefined) {
+      updateData.fullName = this.normalizeNullableText(
+        [nextFirstName, nextLastName].filter(Boolean).join(' '),
+        120,
+      );
+    }
+    if (dto.dob !== undefined) {
+      updateData.dob = dto.dob ? new Date(dto.dob) : null;
+    }
+    if (dto.address !== undefined) {
+      updateData.address = this.normalizeNullableText(dto.address, 255);
+    }
+    if (dto.avatarUrl !== undefined) {
+      updateData.avatarUrl = this.normalizeNullableText(dto.avatarUrl, 512);
+    }
+    if (dto.timezone !== undefined) {
+      updateData.timezone = this.normalizeNullableText(dto.timezone, 64);
+    }
+    if (dto.locale !== undefined) {
+      const normalizedLocale = this.normalizeNullableText(dto.locale, 16);
+      updateData.locale = normalizedLocale ? normalizedLocale.toLowerCase() : null;
+    }
+
+    if (
+      dto.displayName === undefined &&
+      (dto.fullName !== undefined ||
+        dto.firstName !== undefined ||
+        dto.lastName !== undefined)
+    ) {
+      updateData.displayName = this.buildDisplayName(
+        {
+          firstName: nextFirstName,
+          lastName: nextLastName,
+          fullName:
+            dto.fullName !== undefined
+              ? normalizedFullNameInput ?? null
+              : existing.fullName,
+          email: existing.email,
+          fallbackDisplayName: existing.displayName,
+        },
+      );
+    }
+
+    if (Object.keys(updateData).length === 0) {
+      return this.toPublicUser(existing);
+    }
+
+    const updated = await this.usersService.updateById(userId, updateData);
+    return this.toPublicUser(updated);
+  }
+
+  async changePassword(
+    userId: string,
+    dto: ChangePasswordDto,
+    sessionContext: SessionContext,
+  ): Promise<{ success: true }> {
+    const user = await this.usersService.findById(userId);
+    if (!user) {
+      throw new UnauthorizedException({
+        code: 'USER_NOT_FOUND',
+        message: 'User does not exist',
+      });
+    }
+
+    const currentPasswordMatches = await argon2.verify(
+      user.passwordHash,
+      dto.currentPassword,
+    );
+    if (!currentPasswordMatches) {
+      throw new BadRequestException({
+        code: 'PASSWORD_MISMATCH',
+        message: 'Current password is incorrect',
+      });
+    }
+
+    if (dto.currentPassword === dto.newPassword) {
+      throw new BadRequestException({
+        code: 'PASSWORD_REUSE',
+        message: 'New password must be different from current password',
+      });
+    }
+
+    if (user.twoFactorEnabled && user.twoFactorSecret) {
+      this.assertTwoFactorInputProvided(dto.otp, dto.backupCode);
+
+      if (dto.otp) {
+        const secret = this.decryptTwoFactorSecret(user.twoFactorSecret);
+        const otpIsValid = this.verifyTotpCode(secret, dto.otp);
+        if (!otpIsValid) {
+          throw new UnauthorizedException('Invalid OTP code');
+        }
+      } else if (dto.backupCode) {
+        const consumed = await this.consumeBackupCode(user, dto.backupCode);
+        if (!consumed) {
+          throw new UnauthorizedException('Invalid backup code');
+        }
+      }
+    }
+
+    const nextPasswordHash = await argon2.hash(dto.newPassword, {
+      type: argon2.argon2id,
+    });
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.user.update({
+        where: { id: user.id },
+        data: {
+          passwordHash: nextPasswordHash,
+        },
+      });
+
+      await this.revokeActiveSessionsForUser(
+        tx,
+        user.id,
+        SessionRevokeReason.SECURITY,
+        sessionContext,
+      );
+
+      await this.writeAuditLog(tx, {
+        userId: user.id,
+        email: user.email,
+        ip: sessionContext.ip,
+        userAgent: sessionContext.userAgent,
+        action: AuditAction.SECURITY_EVENT,
+        detail: {
+          type: 'PASSWORD_CHANGED',
+        },
+      });
+    });
+
+    return { success: true };
+  }
+
   async listSessions(
     userId: string,
     currentSessionId?: string,
@@ -682,6 +906,521 @@ export class AuthService {
     return { revoked: result };
   }
 
+  async getAdminSecurityDashboard(actorUserId: string): Promise<{
+    data: {
+      users: {
+        total: number;
+        active: number;
+        locked: number;
+        disabled: number;
+      };
+      sessions: {
+        active: number;
+        revokedLast24h: number;
+      };
+      security: {
+        twoFactorEnabledUsers: number;
+        loginFailuresLast24h: number;
+      };
+    };
+  }> {
+    await this.requireSystemAdmin(actorUserId);
+
+    const last24h = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const [
+      totalUsers,
+      activeUsers,
+      lockedUsers,
+      disabledUsers,
+      activeSessions,
+      revokedLast24h,
+      twoFactorEnabledUsers,
+      loginFailuresLast24h,
+    ] = await Promise.all([
+      this.prisma.user.count(),
+      this.prisma.user.count({ where: { status: UserStatus.ACTIVE } }),
+      this.prisma.user.count({ where: { status: UserStatus.LOCKED } }),
+      this.prisma.user.count({ where: { status: UserStatus.DISABLED } }),
+      this.prisma.session.count({ where: { revokedAt: null } }),
+      this.prisma.session.count({
+        where: {
+          revokedAt: {
+            gte: last24h,
+          },
+        },
+      }),
+      this.prisma.user.count({
+        where: {
+          twoFactorEnabled: true,
+        },
+      }),
+      this.prisma.auditLog.count({
+        where: {
+          action: AuditAction.LOGIN_FAIL,
+          createdAt: {
+            gte: last24h,
+          },
+        },
+      }),
+    ]);
+
+    return {
+      data: {
+        users: {
+          total: totalUsers,
+          active: activeUsers,
+          locked: lockedUsers,
+          disabled: disabledUsers,
+        },
+        sessions: {
+          active: activeSessions,
+          revokedLast24h,
+        },
+        security: {
+          twoFactorEnabledUsers,
+          loginFailuresLast24h,
+        },
+      },
+    };
+  }
+
+  async listAdminUsers(
+    actorUserId: string,
+    query: AdminUsersQuery,
+  ): Promise<{
+    data: Array<{
+      id: string;
+      email: string;
+      status: UserStatus;
+      systemRole: SystemRole;
+      firstName: string | null;
+      lastName: string | null;
+      displayName: string | null;
+      fullName: string | null;
+      twoFactorEnabled: boolean;
+      createdAt: Date;
+      updatedAt: Date;
+      lastLoginAt: Date | null;
+    }>;
+    meta: { page: number; limit: number; total: number; totalPages: number };
+  }> {
+    await this.requireSystemAdmin(actorUserId);
+    const pagination = this.resolvePagination(query.page, query.limit);
+
+    const where: Prisma.UserWhereInput = {
+      ...(query.status ? { status: query.status } : {}),
+      ...(query.systemRole ? { systemRole: query.systemRole } : {}),
+    };
+
+    const q = String(query.q ?? '').trim();
+    if (q) {
+      where.OR = [
+        { email: { contains: q, mode: 'insensitive' } },
+        { displayName: { contains: q, mode: 'insensitive' } },
+        { fullName: { contains: q, mode: 'insensitive' } },
+      ];
+    }
+
+    const [total, users] = await Promise.all([
+      this.prisma.user.count({ where }),
+      this.prisma.user.findMany({
+        where,
+        orderBy: {
+          createdAt: 'desc',
+        },
+        skip: pagination.skip,
+        take: pagination.limit,
+        select: {
+          id: true,
+          email: true,
+          status: true,
+          systemRole: true,
+          firstName: true,
+          lastName: true,
+          displayName: true,
+          fullName: true,
+          twoFactorEnabled: true,
+          createdAt: true,
+          updatedAt: true,
+          lastLoginAt: true,
+        },
+      }),
+    ]);
+
+    return {
+      data: users,
+      meta: {
+        page: pagination.page,
+        limit: pagination.limit,
+        total,
+        totalPages: Math.max(1, Math.ceil(total / pagination.limit)),
+      },
+    };
+  }
+
+  async updateAdminUserStatus(
+    actorUserId: string,
+    targetUserId: string,
+    status: UserStatus,
+  ): Promise<{
+    data: {
+      id: string;
+      status: UserStatus;
+      systemRole: SystemRole;
+      updatedAt: Date;
+    };
+  }> {
+    const actor = await this.requireSystemAdmin(actorUserId);
+    if (
+      actor.id === targetUserId &&
+      (status === UserStatus.DISABLED || status === UserStatus.LOCKED)
+    ) {
+      throw new BadRequestException({
+        code: 'INVALID_OPERATION',
+        message: 'Cannot lock or disable your own account',
+      });
+    }
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const target = await tx.user.findUnique({ where: { id: targetUserId } });
+      if (!target) {
+        throw new NotFoundException({
+          code: 'USER_NOT_FOUND',
+          message: 'User not found',
+        });
+      }
+
+      const next = await tx.user.update({
+        where: { id: targetUserId },
+        data: { status },
+        select: {
+          id: true,
+          status: true,
+          systemRole: true,
+          updatedAt: true,
+        },
+      });
+
+      if (status !== UserStatus.ACTIVE) {
+        const now = new Date();
+        const activeSessions = await tx.session.findMany({
+          where: {
+            userId: targetUserId,
+            revokedAt: null,
+          },
+          select: { id: true },
+        });
+        if (activeSessions.length > 0) {
+          const sessionIds = activeSessions.map((item) => item.id);
+          await tx.session.updateMany({
+            where: { id: { in: sessionIds } },
+            data: {
+              revokedAt: now,
+              revokeReason: SessionRevokeReason.ADMIN,
+            },
+          });
+          await tx.refreshToken.updateMany({
+            where: {
+              sessionId: { in: sessionIds },
+              revokedAt: null,
+            },
+            data: {
+              revokedAt: now,
+            },
+          });
+        }
+      }
+
+      await this.writeAuditLog(tx, {
+        userId: actor.id,
+        email: actor.email,
+        action: AuditAction.SECURITY_EVENT,
+        detail: {
+          event: 'ADMIN_USER_STATUS_UPDATED',
+          targetUserId,
+          status,
+        },
+      });
+
+      return next;
+    });
+
+    return {
+      data: updated,
+    };
+  }
+
+  async updateAdminUserSystemRole(
+    actorUserId: string,
+    targetUserId: string,
+    systemRole: SystemRole,
+  ): Promise<{
+    data: {
+      id: string;
+      status: UserStatus;
+      systemRole: SystemRole;
+      updatedAt: Date;
+    };
+  }> {
+    const actor = await this.requireSystemAdmin(actorUserId);
+    if (
+      actor.systemRole !== SystemRole.SUPER_ADMIN &&
+      systemRole === SystemRole.SUPER_ADMIN
+    ) {
+      throw new ForbiddenException({
+        code: 'AUTH_FORBIDDEN',
+        message: 'Only SUPER_ADMIN can assign SUPER_ADMIN role',
+      });
+    }
+
+    if (
+      actor.id === targetUserId &&
+      actor.systemRole === SystemRole.SUPER_ADMIN &&
+      systemRole !== SystemRole.SUPER_ADMIN
+    ) {
+      throw new BadRequestException({
+        code: 'INVALID_OPERATION',
+        message: 'SUPER_ADMIN cannot downgrade own role',
+      });
+    }
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const target = await tx.user.findUnique({ where: { id: targetUserId } });
+      if (!target) {
+        throw new NotFoundException({
+          code: 'USER_NOT_FOUND',
+          message: 'User not found',
+        });
+      }
+
+      if (
+        actor.systemRole !== SystemRole.SUPER_ADMIN &&
+        target.systemRole === SystemRole.SUPER_ADMIN
+      ) {
+        throw new ForbiddenException({
+          code: 'AUTH_FORBIDDEN',
+          message: 'Only SUPER_ADMIN can modify SUPER_ADMIN account',
+        });
+      }
+
+      const next = await tx.user.update({
+        where: { id: targetUserId },
+        data: { systemRole },
+        select: {
+          id: true,
+          status: true,
+          systemRole: true,
+          updatedAt: true,
+        },
+      });
+
+      await this.writeAuditLog(tx, {
+        userId: actor.id,
+        email: actor.email,
+        action: AuditAction.SECURITY_EVENT,
+        detail: {
+          event: 'ADMIN_USER_SYSTEM_ROLE_UPDATED',
+          targetUserId,
+          systemRole,
+        },
+      });
+
+      return next;
+    });
+
+    return {
+      data: updated,
+    };
+  }
+
+  async listAdminUserSessions(
+    actorUserId: string,
+    targetUserId: string,
+  ): Promise<{
+    data: SessionView[];
+  }> {
+    await this.requireSystemAdmin(actorUserId);
+    const target = await this.usersService.findById(targetUserId);
+    if (!target) {
+      throw new NotFoundException({
+        code: 'USER_NOT_FOUND',
+        message: 'User not found',
+      });
+    }
+
+    const sessions = await this.prisma.session.findMany({
+      where: {
+        userId: targetUserId,
+      },
+      orderBy: {
+        createdAt: 'desc',
+      },
+    });
+
+    return {
+      data: sessions.map((session) => ({
+        id: session.id,
+        createdAt: session.createdAt,
+        expiresAt: this.getSessionExpiresAt(session.createdAt),
+        lastUsedAt: session.lastSeenAt,
+        createdByIp: session.ip,
+        createdByUserAgent: session.userAgent,
+        isCurrent: false,
+      })),
+    };
+  }
+
+  async revokeAdminUserSessions(
+    actorUserId: string,
+    targetUserId: string,
+    sessionId?: string,
+  ): Promise<{ data: { revoked: number } }> {
+    const actor = await this.requireSystemAdmin(actorUserId);
+    const result = await this.prisma.$transaction(async (tx) => {
+      const target = await tx.user.findUnique({ where: { id: targetUserId } });
+      if (!target) {
+        throw new NotFoundException({
+          code: 'USER_NOT_FOUND',
+          message: 'User not found',
+        });
+      }
+
+      const sessions = await tx.session.findMany({
+        where: {
+          userId: targetUserId,
+          revokedAt: null,
+          ...(sessionId ? { id: sessionId } : {}),
+        },
+        select: {
+          id: true,
+        },
+      });
+
+      if (sessions.length === 0) {
+        return 0;
+      }
+
+      const now = new Date();
+      const sessionIds = sessions.map((item) => item.id);
+      await tx.session.updateMany({
+        where: {
+          id: {
+            in: sessionIds,
+          },
+        },
+        data: {
+          revokedAt: now,
+          revokeReason: SessionRevokeReason.ADMIN,
+        },
+      });
+      await tx.refreshToken.updateMany({
+        where: {
+          sessionId: {
+            in: sessionIds,
+          },
+          revokedAt: null,
+        },
+        data: {
+          revokedAt: now,
+        },
+      });
+
+      await this.writeAuditLog(tx, {
+        userId: actor.id,
+        email: actor.email,
+        action: AuditAction.SESSION_REVOKED,
+        detail: {
+          reason: SessionRevokeReason.ADMIN,
+          targetUserId,
+          count: sessionIds.length,
+          sessionId: sessionId ?? null,
+        },
+      });
+
+      return sessionIds.length;
+    });
+
+    return {
+      data: {
+        revoked: result,
+      },
+    };
+  }
+
+  async listAdminAuditLogs(
+    actorUserId: string,
+    query: AdminAuditLogsQuery,
+  ): Promise<{
+    data: Array<{
+      id: string;
+      userId: string | null;
+      email: string | null;
+      ip: string | null;
+      userAgent: string | null;
+      action: AuditAction;
+      detail: Prisma.JsonValue | null;
+      createdAt: Date;
+    }>;
+    meta: { page: number; limit: number; total: number; totalPages: number };
+  }> {
+    await this.requireSystemAdmin(actorUserId);
+    const pagination = this.resolvePagination(query.page, query.limit);
+    const where: Prisma.AuditLogWhereInput = {
+      ...(query.userId ? { userId: query.userId } : {}),
+    };
+    if (query.action) {
+      const action = String(query.action).trim();
+      if ((Object.values(AuditAction) as string[]).includes(action)) {
+        where.action = action as AuditAction;
+      }
+    }
+    if (query.email) {
+      where.email = {
+        contains: query.email.trim(),
+        mode: 'insensitive',
+      };
+    }
+    if (query.from || query.to) {
+      const from = this.parseDateInput(query.from, 'from');
+      const to = this.parseDateInput(query.to, 'to');
+      where.createdAt = {
+        ...(from ? { gte: from } : {}),
+        ...(to ? { lte: to } : {}),
+      };
+    }
+
+    const [total, rows] = await Promise.all([
+      this.prisma.auditLog.count({ where }),
+      this.prisma.auditLog.findMany({
+        where,
+        orderBy: {
+          createdAt: 'desc',
+        },
+        skip: pagination.skip,
+        take: pagination.limit,
+      }),
+    ]);
+
+    return {
+      data: rows.map((row) => ({
+        id: row.id,
+        userId: row.userId,
+        email: row.email,
+        ip: row.ip,
+        userAgent: row.userAgent,
+        action: row.action,
+        detail: row.detail as Prisma.JsonValue | null,
+        createdAt: row.createdAt,
+      })),
+      meta: {
+        page: pagination.page,
+        limit: pagination.limit,
+        total,
+        totalPages: Math.max(1, Math.ceil(total / pagination.limit)),
+      },
+    };
+  }
+
   getGoogleAuthorizationUrl(state: string): string {
     if (!this.isGoogleOAuthConfigured()) {
       throw new ServiceUnavailableException('Google login is not configured');
@@ -756,24 +1495,63 @@ export class AuthService {
     }
 
     const normalizedEmail = profile.email.toLowerCase().trim();
+    const googleName = this.normalizeNullableText(profile.name, 120);
     let user = await this.usersService.findByGoogleId(profile.sub);
 
     if (!user) {
       const existingByEmail =
         await this.usersService.findByEmail(normalizedEmail);
       if (existingByEmail) {
-        user = await this.usersService.updateById(existingByEmail.id, {
+        const patch: Prisma.UserUpdateInput = {
           googleId: profile.sub,
-          fullName: existingByEmail.fullName ?? profile.name?.trim() ?? null,
-        });
+        };
+        const shouldBackfillFirstName =
+          !this.normalizeNullableText(existingByEmail.firstName, 120) &&
+          googleName;
+        if (shouldBackfillFirstName) {
+          patch.firstName = googleName;
+        }
+        const shouldBackfillFullName =
+          !this.normalizeNullableText(existingByEmail.fullName, 120) &&
+          googleName;
+        if (shouldBackfillFullName) {
+          patch.fullName = googleName;
+        }
+        if (
+          !this.normalizeNullableText(existingByEmail.displayName, 120) ||
+          shouldBackfillFirstName ||
+          shouldBackfillFullName
+        ) {
+          patch.displayName = this.buildDisplayName({
+            firstName: shouldBackfillFirstName
+              ? googleName
+              : existingByEmail.firstName,
+            lastName: existingByEmail.lastName,
+            fullName: shouldBackfillFullName
+              ? googleName
+              : existingByEmail.fullName,
+            email: existingByEmail.email,
+            fallbackDisplayName: existingByEmail.displayName,
+          });
+        }
+        user = await this.usersService.updateById(existingByEmail.id, patch);
       } else {
         const passwordHash = await argon2.hash(randomUUID(), {
           type: argon2.argon2id,
         });
+        const firstName = googleName ?? normalizedEmail.split('@')[0];
         const createdUser = await this.usersService.create({
           email: normalizedEmail,
           passwordHash,
-          fullName: profile.name?.trim() || null,
+          firstName,
+          lastName: null,
+          fullName: googleName,
+          displayName: this.buildDisplayName({
+            firstName,
+            lastName: null,
+            fullName: googleName,
+            email: normalizedEmail,
+          }),
         });
         user = await this.usersService.updateById(createdUser.id, {
           googleId: profile.sub,
@@ -852,6 +1630,7 @@ export class AuthService {
       user.id,
       user.email,
       sessionId,
+      user.systemRole,
     );
 
     await tx.session.create({
@@ -876,12 +1655,14 @@ export class AuthService {
     userId: string,
     email: string,
     sessionId: string,
+    systemRole: SystemRole,
   ): Promise<string> {
     return this.jwtService.signAsync(
       {
         sub: userId,
         email,
         sid: sessionId,
+        systemRole,
       },
       {
         algorithm: 'RS256',
@@ -1065,11 +1846,79 @@ export class AuthService {
       id: user.id,
       email: user.email,
       status: user.status,
+      systemRole: user.systemRole,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      displayName: user.displayName,
+      dob: user.dob,
+      address: user.address,
+      avatarUrl: user.avatarUrl,
+      timezone: user.timezone,
+      locale: user.locale,
       fullName: user.fullName,
       twoFactorEnabled: user.twoFactorEnabled,
       createdAt: user.createdAt,
       updatedAt: user.updatedAt,
     };
+  }
+
+  private buildDisplayName(input: {
+    firstName?: string | null;
+    lastName?: string | null;
+    fullName?: string | null;
+    email: string;
+    fallbackDisplayName?: string | null;
+  }): string {
+    const normalizedFirstName = this.normalizeNullableText(input.firstName, 120);
+    const normalizedLastName = this.normalizeNullableText(input.lastName, 120);
+    const normalizedFullName = this.normalizeNullableText(input.fullName, 120);
+    const normalizedFallbackDisplayName = this.normalizeNullableText(
+      input.fallbackDisplayName,
+      120,
+    );
+
+    const splitName = this.normalizeNullableText(
+      [normalizedFirstName, normalizedLastName].filter(Boolean).join(' '),
+      120,
+    );
+    if (splitName) {
+      return splitName;
+    }
+
+    if (normalizedFirstName) {
+      return normalizedFirstName;
+    }
+
+    if (normalizedFullName) {
+      return normalizedFullName;
+    }
+
+    if (normalizedFallbackDisplayName) {
+      return normalizedFallbackDisplayName;
+    }
+
+    const localPart = String(input.email || '').split('@')[0].trim();
+    if (localPart) {
+      return localPart.slice(0, 120);
+    }
+
+    return 'User';
+  }
+
+  private normalizeNullableText(
+    value: string | null | undefined,
+    maxLength: number,
+  ): string | null {
+    if (typeof value !== 'string') {
+      return null;
+    }
+
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+
+    return trimmed.slice(0, maxLength);
   }
 
   private verifyTotpCode(secret: string, otp: string): boolean {
@@ -1238,6 +2087,55 @@ export class AuthService {
         this.failedAuthAttempts.delete(key);
       }
     }
+  }
+
+  private async requireSystemAdmin(userId: string): Promise<User> {
+    const user = await this.usersService.findById(userId);
+    if (!user) {
+      throw new UnauthorizedException({
+        code: 'USER_NOT_FOUND',
+        message: 'User does not exist',
+      });
+    }
+    if (!SYSTEM_ADMIN_ROLES.has(user.systemRole)) {
+      throw new ForbiddenException({
+        code: 'AUTH_FORBIDDEN',
+        message: 'Admin permission required',
+      });
+    }
+    return user;
+  }
+
+  private resolvePagination(
+    page?: number,
+    limit?: number,
+  ): { page: number; limit: number; skip: number } {
+    const safePage =
+      Number.isInteger(page) && Number(page) > 0 ? Number(page) : 1;
+    const safeLimit =
+      Number.isInteger(limit) && Number(limit) > 0
+        ? Math.min(Number(limit), 100)
+        : 20;
+
+    return {
+      page: safePage,
+      limit: safeLimit,
+      skip: (safePage - 1) * safeLimit,
+    };
+  }
+
+  private parseDateInput(value: string | undefined, fieldName: string): Date | null {
+    if (!value) {
+      return null;
+    }
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) {
+      throw new BadRequestException({
+        code: 'VALIDATION_ERROR',
+        message: `Invalid ${fieldName} datetime`,
+      });
+    }
+    return parsed;
   }
 
   private buildAuthAttemptKey(email: string, requestIp: string): string {
