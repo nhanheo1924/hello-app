@@ -145,21 +145,72 @@ async function bootstrapSettingPage() {
 
         if (shouldUseHistoryBack) {
             window.history.back();
+            window.setTimeout(() => {
+                const currentPath = String(window.location.pathname || '');
+                if (currentPath.endsWith('/setting') || currentPath.endsWith('/setting/')) {
+                    window.location.href = homePath;
+                }
+            }, 220);
             return;
         }
 
         if (window.parent && window.parent !== window) {
-            window.parent.postMessage(
-                {
-                    type: 'orbit-shell-navigate',
-                    path: homePath
-                },
-                window.location.origin
-            );
+            try {
+                window.parent.postMessage(
+                    {
+                        type: 'orbit-shell-navigate',
+                        path: homePath
+                    },
+                    '*'
+                );
+            } catch (_) {
+                // ignore parent postMessage failures
+            }
+            window.setTimeout(() => {
+                const currentPath = String(window.location.pathname || '');
+                if (currentPath.endsWith('/setting') || currentPath.endsWith('/setting/')) {
+                    window.location.href = homePath;
+                }
+            }, 220);
             return;
         }
 
         window.location.href = homePath;
+    }
+
+    function hardenSensitiveField(field) {
+        if (!field) return;
+        field.setAttribute('autocomplete', 'off');
+        field.setAttribute('autocapitalize', 'none');
+        field.setAttribute('autocorrect', 'off');
+        field.setAttribute('spellcheck', 'false');
+        const suffix = Math.random().toString(36).slice(2, 8);
+        if (field.id) {
+            field.setAttribute('name', `${field.id}_${suffix}`);
+        }
+        field.readOnly = true;
+        field.addEventListener('focus', () => {
+            field.readOnly = false;
+        });
+        field.addEventListener('pointerdown', () => {
+            field.readOnly = false;
+        });
+    }
+
+    function hardenSensitiveFields() {
+        const sensitiveIds = [
+            'twoFactorConfirmOtpInput',
+            'twoFactorDisableOtpInput',
+            'twoFactorDisableBackupInput',
+            'currentPasswordInput',
+            'newPasswordInput',
+            'confirmNewPasswordInput',
+            'passwordOtpInput',
+            'passwordBackupCodeInput'
+        ];
+        sensitiveIds.forEach((id) => {
+            hardenSensitiveField(document.getElementById(id));
+        });
     }
 
     const logo = document.querySelector('.logo');
@@ -178,6 +229,7 @@ async function bootstrapSettingPage() {
             }
         });
     }
+    hardenSensitiveFields();
 
     const SETTINGS_KEY = 'orbitSettings';
     const PROJECTS_KEY = 'helloProjectsState';

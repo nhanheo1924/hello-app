@@ -368,7 +368,7 @@ export class ProxyService {
 
   private buildForwardHeaders(
     request: Request,
-    _options: ForwardOptions,
+    options: ForwardOptions,
   ): Headers {
     const headers = new Headers();
 
@@ -378,11 +378,26 @@ export class ProxyService {
       }
 
       const normalizedName = String(name).toLowerCase();
+      if (normalizedName === 'cookie') {
+        if (options.upstream === 'auth') {
+          if (Array.isArray(value)) {
+            const joined = value.join('; ').trim();
+            if (joined) {
+              headers.set('cookie', joined);
+            }
+          } else {
+            const cookieValue = String(value).trim();
+            if (cookieValue) {
+              headers.set('cookie', cookieValue);
+            }
+          }
+        }
+        continue;
+      }
       if (
         normalizedName === 'host' ||
         normalizedName === 'connection' ||
-        normalizedName === 'content-length' ||
-        normalizedName === 'cookie'
+        normalizedName === 'content-length'
       ) {
         continue;
       }

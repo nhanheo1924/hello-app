@@ -90,6 +90,7 @@ type ChangePasswordResult =
 const AUTH_PROFILE_RESOURCE_KEY = 'auth.me.profile';
 const AUTH_PROFILE_SESSION_CACHE_KEY = 'orbitAuthProfileCacheV1';
 const AUTH_PROFILE_TTL_MS = 5 * 60 * 1000;
+const SIGN_IN_RETRY_DELAYS_MS = [5_000, 10_000] as const;
 
 async function authRequest<T>(
   path: string,
@@ -107,6 +108,49 @@ function extractErrorMessage(error: unknown, fallbackMessage: string): string {
   return error && typeof error === 'object' && 'message' in error
     ? String((error as { message?: string }).message || fallbackMessage)
     : fallbackMessage;
+}
+
+function extractErrorStatus(error: unknown): number {
+  if (!error || typeof error !== 'object' || !('status' in error)) {
+    return 0;
+  }
+  const status = Number((error as { status?: unknown }).status);
+  return Number.isFinite(status) ? status : 0;
+}
+
+function extractErrorCode(error: unknown): string {
+  if (!error || typeof error !== 'object' || !('body' in error)) {
+    return '';
+  }
+  const body = (error as { body?: unknown }).body;
+  if (!body || typeof body !== 'object') {
+    return '';
+  }
+  const code = (body as { code?: unknown }).code;
+  return typeof code === 'string' ? code.trim().toUpperCase() : '';
+}
+
+function shouldRetrySignIn(error: unknown): boolean {
+  const status = extractErrorStatus(error);
+  const code = extractErrorCode(error);
+  if (status === 0 || status === 429) {
+    return true;
+  }
+  if (status >= 500) {
+    return true;
+  }
+  return (
+    code === 'BAD_GATEWAY' ||
+    code === 'GATEWAY_TIMEOUT' ||
+    code === 'UPSTREAM_UNAVAILABLE' ||
+    code === 'NETWORK_ERROR'
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
 }
 
 function buildGoogleStartUrl(): string {
@@ -167,36 +211,51 @@ function completeSessionFromResponse(response: AuthApiResponse): AuthUser | null
 }
 
 export async function signIn(input: { email: string; password: string }): Promise<SignInResult> {
-  try {
-    const payload = {
-      email: normalizeEmail(input.email),
-      password: String(input.password || '')
-    };
+  const payload = {
+    email: normalizeEmail(input.email),
+    password: String(input.password || '')
+  };
+  const maxAttempts = 1 + SIGN_IN_RETRY_DELAYS_MS.length;
+  let lastError: unknown = null;
 
-    const response = await authRequest<AuthApiResponse>('/login', {
-      method: 'POST',
-      body: JSON.stringify(payload)
-    });
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const response = await authRequest<AuthApiResponse>('/login', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
 
-    if (response.requiresTwoFactor === true) {
-      return {
-        ok: false,
-        requiresTwoFactor: true,
-        twoFactorToken: typeof response.twoFactorToken === 'string'
-          ? response.twoFactorToken
-          : undefined,
-        error: 'This account requires 2FA verification.'
-      };
+      if (response.requiresTwoFactor === true) {
+        return {
+          ok: false,
+          requiresTwoFactor: true,
+          twoFactorToken: typeof response.twoFactorToken === 'string'
+            ? response.twoFactorToken
+            : undefined,
+          error: 'This account requires 2FA verification.'
+        };
+      }
+
+      const user = completeSessionFromResponse(response);
+      return { ok: true, user };
+    } catch (error) {
+      lastError = error;
+      const shouldRetry =
+        attempt < maxAttempts && shouldRetrySignIn(error);
+      if (!shouldRetry) {
+        break;
+      }
+      const retryDelayMs = SIGN_IN_RETRY_DELAYS_MS[attempt - 1] || 0;
+      if (retryDelayMs > 0) {
+        await sleep(retryDelayMs);
+      }
     }
-
-    const user = completeSessionFromResponse(response);
-    return { ok: true, user };
-  } catch (error) {
-    return {
-      ok: false,
-      error: extractErrorMessage(error, 'Unable to sign in.')
-    };
   }
+
+  return {
+    ok: false,
+    error: extractErrorMessage(lastError, 'Unable to sign in.')
+  };
 }
 
 export async function registerUser(input: {
