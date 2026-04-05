@@ -1,15 +1,18 @@
 import { appRoutes, resolveAppPath } from '../../core/config/routes';
 import { exchangeOauthCode } from '../../core/auth/auth-api';
+import { bootstrapAppI18n } from '../../core/i18n/app-i18n';
 
 const statusTitleNode = document.getElementById('auth-callback-status-title');
 const statusDetailNode = document.getElementById('auth-callback-status-detail');
+const i18n = bootstrapAppI18n();
+const t = (value: string): string => i18n.t(value);
 
 function setStatus(title: string, detail = '', isError = false): void {
   if (statusTitleNode) {
-    statusTitleNode.textContent = title;
+    statusTitleNode.textContent = t(title);
   }
   if (statusDetailNode) {
-    statusDetailNode.textContent = detail;
+    statusDetailNode.textContent = t(detail);
   }
   document.body.classList.toggle('is-error', isError);
 }
@@ -62,13 +65,13 @@ async function runOauthCallback(): Promise<void> {
       if (result.requiresTwoFactor) {
         redirectToSignin({
           google: '2fa',
-          message: result.error || 'Google account requires 2FA verification.'
+          message: t(result.error || 'Google account requires 2FA verification.')
         });
         return;
       }
       redirectToSignin({
         google: 'error',
-        message: result.error || 'OAuth authentication failed.'
+        message: t(result.error || 'OAuth authentication failed.')
       });
       return;
     }
@@ -88,7 +91,7 @@ async function runOauthCallback(): Promise<void> {
 
   redirectToSignin({
     google: 'error',
-    message: 'Missing OAuth callback data.'
+    message: t('Missing OAuth callback data.')
   });
 }
 
@@ -97,7 +100,7 @@ void runOauthCallback().catch(() => {
   setTimeout(() => {
     redirectToSignin({
       google: 'error',
-      message: 'Unable to complete OAuth callback.'
+      message: t('Unable to complete OAuth callback.')
     });
   }, 1200);
 });

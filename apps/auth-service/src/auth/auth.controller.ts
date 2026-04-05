@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   Patch,
@@ -32,12 +33,16 @@ import {
   AdminAuditLogsQueryDto,
   AdminUsersQueryDto,
 } from './dto/admin-query.dto';
+import { RefreshSessionDto } from './dto/refresh-session.dto';
+import { ResetPasswordByOtpDto } from './dto/reset-password-by-otp.dto';
 import { RegisterDto } from './dto/register.dto';
 import { RevokeAdminSessionsDto } from './dto/revoke-admin-sessions.dto';
 import { RevokeSessionDto } from './dto/revoke-session.dto';
+import { SendEmailOtpDto } from './dto/send-email-otp.dto';
 import { UpdateAdminUserStatusDto } from './dto/update-admin-user-status.dto';
 import { UpdateAdminUserSystemRoleDto } from './dto/update-admin-user-system-role.dto';
 import { UpdateProfileDto } from './dto/update-profile.dto';
+import { VerifyEmailOtpDto } from './dto/verify-email-otp.dto';
 import { VerifyTwoFactorLoginDto } from './dto/verify-two-factor-login.dto';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import type { PublicUser } from './interfaces/auth-response.interface';
@@ -54,6 +59,7 @@ export class AuthController {
   private readonly webAppOauthCallbackUrl: string;
   private readonly publicAuthBasePath: string;
   private readonly allowedWebOrigins: Set<string>;
+  private readonly refreshTokenCookieName: string;
 
   constructor(
     private readonly authService: AuthService,
@@ -100,6 +106,9 @@ export class AuthController {
       this.webAppUrl,
       this.webAppOauthCallbackUrl,
     );
+    this.refreshTokenCookieName = String(
+      this.configService.get<string>('AUTH_REFRESH_COOKIE_NAME', 'ctm_rt'),
+    ).trim();
   }
 
   @Throttle({ default: { limit: 5, ttl: 60_000 } })
@@ -113,7 +122,19 @@ export class AuthController {
     return this.toAuthResponse(result);
   }
 
-  @Throttle({ default: { limit: 8, ttl: 60_000 } })
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @Post('otp/email/send')
+  sendEmailOtp(@Body() dto: SendEmailOtpDto) {
+    return this.authService.sendEmailOTP(dto.email, dto.type);
+  }
+
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @Post('otp/email/verify')
+  verifyEmailOtp(@Body() dto: VerifyEmailOtpDto) {
+    return this.authService.verifyEmailOTP(dto.email, dto.code, dto.type);
+  }
+
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
   @Post('login')
   async login(@Body() dto: LoginDto, @Req() request: Request) {
     const result = await this.authService.login(
@@ -124,6 +145,29 @@ export class AuthController {
     if (this.isTwoFactorChallenge(result)) {
       return result;
     }
+
+    return this.toAuthResponse(result);
+  }
+
+  @Throttle({ default: { limit: 60, ttl: 60_000 } })
+  @Post('refresh')
+  async refresh(@Body() dto: RefreshSessionDto, @Req() request: Request) {
+    const refreshToken =
+      String(dto.refreshToken || '').trim() ||
+      this.getCookieValue(request, this.refreshTokenCookieName) ||
+      '';
+
+    if (!refreshToken) {
+      throw new UnauthorizedException({
+        code: 'REFRESH_TOKEN_MISSING',
+        message: 'Refresh token is required',
+      });
+    }
+
+    const result = await this.authService.refreshSession(
+      refreshToken,
+      this.getSessionContext(request),
+    );
 
     return this.toAuthResponse(result);
   }
@@ -357,6 +401,22 @@ export class AuthController {
     );
   }
 
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @Post('password/reset')
+  resetPasswordByOtp(
+    @Body() dto: ResetPasswordByOtpDto,
+    @Req() request: Request,
+  ) {
+    return this.authService.resetPasswordWithOtp(
+      {
+        email: dto.email,
+        newPassword: dto.newPassword,
+        otpVerificationToken: dto.otpVerificationToken,
+      },
+      this.getSessionContext(request),
+    );
+  }
+
   @UseGuards(JwtAuthGuard)
   @Get('admin/dashboard/security')
   adminSecurityDashboard(@CurrentUser('userId') userId: string) {
@@ -401,6 +461,20 @@ export class AuthController {
   }
 
   @UseGuards(JwtAuthGuard)
+  @Delete('admin/users/:userId')
+  adminDeleteUser(
+    @CurrentUser('userId') actorUserId: string,
+    @Param('userId') targetUserId: string,
+    @Req() request: Request,
+  ) {
+    return this.authService.deleteAdminUser(
+      actorUserId,
+      targetUserId,
+      this.getSessionContext(request),
+    );
+  }
+
+  @UseGuards(JwtAuthGuard)
   @Get('admin/users/:userId/sessions')
   adminUserSessions(
     @CurrentUser('userId') actorUserId: string,
@@ -434,7 +508,9 @@ export class AuthController {
 
   private toAuthResponse(result: AuthSession): {
     accessToken: string;
+    refreshToken: string;
     expiresIn: number;
+    refreshExpiresIn: number;
     session: { sid: string };
     user: {
       id: string;
@@ -454,7 +530,9 @@ export class AuthController {
   } {
     return {
       accessToken: result.accessToken,
+      refreshToken: result.refreshToken,
       expiresIn: result.expiresIn,
+      refreshExpiresIn: result.refreshExpiresIn,
       session: result.session,
       user: this.toUserResponse(result.user),
     };
@@ -507,9 +585,8 @@ export class AuthController {
   }
 
   private buildWebOauthCallbackUrl(callbackUrlOverride?: string): URL {
-    const normalizedOverride = this.normalizeOauthCallbackUrl(
-      callbackUrlOverride,
-    );
+    const normalizedOverride =
+      this.normalizeOauthCallbackUrl(callbackUrlOverride);
     return new URL(normalizedOverride ?? this.webAppOauthCallbackUrl);
   }
 
@@ -709,4 +786,3 @@ export class AuthController {
     return withLeadingSlash.replace(/\/+$/, '');
   }
 }
-

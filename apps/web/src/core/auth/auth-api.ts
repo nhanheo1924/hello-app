@@ -58,6 +58,13 @@ interface DisableTwoFactorResponse {
   success: boolean;
 }
 
+interface EmailOtpVerifyResponse {
+  success: boolean;
+  verificationToken?: string;
+}
+
+type EmailOtpType = 'REGISTER' | 'RESET_PASSWORD' | 'MFA';
+
 type SignInResult =
   | { ok: true; user: AuthUser | null }
   | {
@@ -84,6 +91,22 @@ type TwoFactorDisableResult =
   | { ok: false; error: string };
 
 type ChangePasswordResult =
+  | { ok: true; success: true }
+  | { ok: false; error: string };
+
+type RegisterUserResult =
+  | { ok: true; user: AuthUser | null }
+  | { ok: false; error: string };
+
+type SendEmailOtpResult =
+  | { ok: true; success: true; cooldownSeconds: number }
+  | { ok: false; error: string; retryAfterSeconds?: number };
+
+type VerifyEmailOtpResult =
+  | { ok: true; success: true; verificationToken: string }
+  | { ok: false; error: string };
+
+type ResetPasswordByOtpResult =
   | { ok: true; success: true }
   | { ok: false; error: string };
 
@@ -130,15 +153,60 @@ function extractErrorCode(error: unknown): string {
   return typeof code === 'string' ? code.trim().toUpperCase() : '';
 }
 
+function extractRetryAfterSeconds(error: unknown): number {
+  if (!error || typeof error !== 'object') {
+    return 0;
+  }
+
+  const direct = Number(
+    (error as { retryAfterSeconds?: unknown }).retryAfterSeconds,
+  );
+  if (Number.isFinite(direct) && direct > 0) {
+    return Math.floor(direct);
+  }
+
+  if (!('body' in error)) {
+    return 0;
+  }
+  const body = (error as { body?: unknown }).body;
+  if (!body || typeof body !== 'object') {
+    return 0;
+  }
+
+  const record = body as {
+    retryAfterSeconds?: unknown;
+    details?: {
+      retryAfterSeconds?: unknown;
+    };
+  };
+  const bodyValue = Number(record.retryAfterSeconds);
+  if (Number.isFinite(bodyValue) && bodyValue > 0) {
+    return Math.floor(bodyValue);
+  }
+
+  const detailValue = Number(record.details?.retryAfterSeconds);
+  if (Number.isFinite(detailValue) && detailValue > 0) {
+    return Math.floor(detailValue);
+  }
+
+  return 0;
+}
+
+function resolveSignInErrorMessage(error: unknown): string {
+  return resolveAuthErrorMessage(error, 'Unable to sign in.');
+}
+
 function shouldRetrySignIn(error: unknown): boolean {
   const status = extractErrorStatus(error);
   const code = extractErrorCode(error);
-  if (status === 0 || status === 429) {
+  if (status === 0) {
     return true;
   }
-  if (status >= 500) {
+
+  if (status === 502 || status === 503 || status === 504) {
     return true;
   }
+
   return (
     code === 'BAD_GATEWAY' ||
     code === 'GATEWAY_TIMEOUT' ||
@@ -151,6 +219,109 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     window.setTimeout(resolve, ms);
   });
+}
+
+function normalizeAuthMessage(message: string, fallbackMessage: string): string {
+  const normalized = String(message || '').trim();
+  if (!normalized) {
+    return fallbackMessage;
+  }
+
+  const lookup = normalized.toLowerCase();
+  if (lookup.includes('invalid otp code')) {
+    return 'Invalid one-time code.';
+  }
+  if (lookup.includes('invalid backup code')) {
+    return 'Invalid backup code.';
+  }
+  if (lookup.includes('provide otp or backup code')) {
+    return 'Enter a one-time code or backup code.';
+  }
+  if (lookup.includes('missing 2fa challenge token')) {
+    return 'The 2FA challenge has expired. Please sign in again.';
+  }
+  if (lookup.includes('invalid or expired 2fa challenge')) {
+    return 'The 2FA challenge has expired. Please sign in again.';
+  }
+  if (lookup.includes('invalid 2fa challenge')) {
+    return 'The 2FA challenge is invalid. Please sign in again.';
+  }
+  if (lookup.includes('current password is incorrect')) {
+    return 'Current password is incorrect.';
+  }
+  if (lookup.includes('new password must be different')) {
+    return 'New password must be different from your current password.';
+  }
+  if (lookup.includes('email verification is required')) {
+    return 'Verify your email code before continuing.';
+  }
+  if (lookup.includes('verification has expired')) {
+    return 'Your verification expired. Please verify again.';
+  }
+  if (lookup.includes('invalid or expired one-time code')) {
+    return 'Invalid or expired one-time code.';
+  }
+  if (
+    lookup.includes('already exists') ||
+    lookup.includes('already registered') ||
+    lookup.includes('email is already in use')
+  ) {
+    return 'An account with this email already exists.';
+  }
+
+  return normalized;
+}
+
+function resolveAuthErrorMessage(error: unknown, fallbackMessage: string): string {
+  const code = extractErrorCode(error);
+
+  if (code === 'INVALID_CREDENTIALS') {
+    return 'Incorrect email or password.';
+  }
+  if (code === 'RATE_LIMITED') {
+    const retryAfterSeconds = extractRetryAfterSeconds(error);
+    if (retryAfterSeconds > 0) {
+      return `Too many sign-in attempts. Try again in ${retryAfterSeconds} seconds.`;
+    }
+    return 'Too many sign-in attempts. Please try again later.';
+  }
+  if (code === 'TWO_FACTOR_INVALID') {
+    return 'The 2FA challenge has expired. Please sign in again.';
+  }
+  if (code === 'PASSWORD_MISMATCH') {
+    return 'Current password is incorrect.';
+  }
+  if (code === 'PASSWORD_REUSE') {
+    return 'New password must be different from your current password.';
+  }
+  if (code === 'OTP_INVALID') {
+    return 'Invalid or expired one-time code.';
+  }
+  if (code === 'OTP_VERIFICATION_REQUIRED') {
+    return 'Verify your email code before continuing.';
+  }
+  if (code === 'OTP_VERIFICATION_INVALID') {
+    return 'Your verification expired. Please verify again.';
+  }
+  if (code === 'OTP_RATE_LIMITED') {
+    const retryAfterSeconds = extractRetryAfterSeconds(error);
+    if (retryAfterSeconds > 0) {
+      return `Please wait ${retryAfterSeconds} seconds before requesting another code.`;
+    }
+    return 'Please wait before requesting another code.';
+  }
+  if (
+    code === 'BAD_GATEWAY' ||
+    code === 'GATEWAY_TIMEOUT' ||
+    code === 'UPSTREAM_UNAVAILABLE'
+  ) {
+    return 'The authentication service is temporarily unavailable. Please try again.';
+  }
+
+  return normalizeAuthMessage(
+    extractErrorMessage(error, fallbackMessage),
+    fallbackMessage,
+  );
 }
 
 function buildGoogleStartUrl(): string {
@@ -254,37 +425,145 @@ export async function signIn(input: { email: string; password: string }): Promis
 
   return {
     ok: false,
-    error: extractErrorMessage(lastError, 'Unable to sign in.')
+    error: resolveSignInErrorMessage(lastError)
   };
 }
 
 export async function registerUser(input: {
   email: string;
   password: string;
+  otpVerificationToken: string;
   firstName?: string;
   lastName?: string;
   fullName?: string;
-}) {
+}): Promise<RegisterUserResult> {
+  const otpVerificationToken = String(input.otpVerificationToken || '').trim();
+  if (!otpVerificationToken) {
+    return {
+      ok: false,
+      error: 'Verify your email code before creating your account.',
+    };
+  }
+
   try {
     const response = await authRequest<AuthApiResponse>('/signup', {
       method: 'POST',
       body: JSON.stringify({
         email: normalizeEmail(input.email),
         password: String(input.password || ''),
+        otpVerificationToken,
         firstName: String(input.firstName || '').trim() || undefined,
         lastName: String(input.lastName || '').trim() || undefined,
         fullName: String(input.fullName || '').trim() || undefined
       })
     });
 
+    const user = completeSessionFromResponse(response);
     return {
       ok: true,
-      user: response.user || null
+      user
     };
   } catch (error) {
     return {
       ok: false,
-      error: extractErrorMessage(error, 'Unable to create account.')
+      error: resolveAuthErrorMessage(error, 'Unable to create account.')
+    };
+  }
+}
+
+export async function sendEmailOtp(input: {
+  email: string;
+  type: EmailOtpType;
+}): Promise<SendEmailOtpResult> {
+  const normalizedEmail = normalizeEmail(input.email);
+  if (!validateEmail(normalizedEmail)) {
+    return {
+      ok: false,
+      error: 'Enter a valid email address.',
+    };
+  }
+
+  try {
+    await authRequest<{ success?: boolean }>('/otp/email/send', {
+      method: 'POST',
+      body: JSON.stringify({
+        email: normalizedEmail,
+        type: input.type,
+      }),
+    });
+    return {
+      ok: true,
+      success: true,
+      cooldownSeconds: 60,
+    };
+  } catch (error) {
+    const retryAfterSeconds = extractRetryAfterSeconds(error);
+    return {
+      ok: false,
+      error: resolveAuthErrorMessage(
+        error,
+        'Unable to send one-time code. Please try again.',
+      ),
+      retryAfterSeconds:
+        retryAfterSeconds > 0 ? retryAfterSeconds : undefined,
+    };
+  }
+}
+
+export async function verifyEmailOtp(input: {
+  email: string;
+  code: string;
+  type: EmailOtpType;
+}): Promise<VerifyEmailOtpResult> {
+  const normalizedEmail = normalizeEmail(input.email);
+  const code = String(input.code || '').trim();
+
+  if (!validateEmail(normalizedEmail)) {
+    return {
+      ok: false,
+      error: 'Enter a valid email address.',
+    };
+  }
+  if (!/^\d{6}$/.test(code)) {
+    return {
+      ok: false,
+      error: 'Enter the 6-digit code from your email.',
+    };
+  }
+
+  try {
+    const response = await authRequest<EmailOtpVerifyResponse>(
+      '/otp/email/verify',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          email: normalizedEmail,
+          code,
+          type: input.type,
+        }),
+      },
+    );
+
+    const verificationToken = String(response.verificationToken || '').trim();
+    if (!verificationToken) {
+      return {
+        ok: false,
+        error: 'Unable to verify one-time code.',
+      };
+    }
+
+    return {
+      ok: true,
+      success: true,
+      verificationToken,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: resolveAuthErrorMessage(
+        error,
+        'Unable to verify one-time code.',
+      ),
     };
   }
 }
@@ -320,7 +599,7 @@ export async function exchangeOauthCode(oauthCode: string): Promise<SignInResult
   } catch (error) {
     return {
       ok: false,
-      error: extractErrorMessage(error, 'Unable to authenticate OAuth callback.')
+      error: resolveAuthErrorMessage(error, 'Unable to authenticate OAuth callback.')
     };
   }
 }
@@ -336,7 +615,7 @@ export async function verifyTwoFactorLogin(input: {
     const twoFactorToken = String(input.twoFactorToken || '').trim();
 
     if (!otp && !backupCode) {
-      return { ok: false, error: 'Please provide OTP or backup code.' };
+      return { ok: false, error: 'Enter a one-time code or backup code.' };
     }
 
     const response = await authRequest<AuthApiResponse>(
@@ -352,7 +631,7 @@ export async function verifyTwoFactorLogin(input: {
     );
 
     if (response.requiresTwoFactor === true) {
-      return { ok: false, error: '2FA challenge is still required.' };
+      return { ok: false, error: 'Two-factor verification is still required.' };
     }
 
     const user = completeSessionFromResponse(response);
@@ -360,7 +639,7 @@ export async function verifyTwoFactorLogin(input: {
   } catch (error) {
     return {
       ok: false,
-      error: extractErrorMessage(error, 'Unable to verify 2FA.')
+      error: resolveAuthErrorMessage(error, 'Unable to verify 2FA.')
     };
   }
 }
@@ -375,7 +654,7 @@ export async function setupTwoFactor(): Promise<TwoFactorSetupResult> {
   } catch (error) {
     return {
       ok: false,
-      error: extractErrorMessage(error, 'Unable to start 2FA setup.')
+      error: resolveAuthErrorMessage(error, 'Unable to start 2FA setup.')
     };
   }
 }
@@ -397,7 +676,7 @@ export async function confirmTwoFactor(otp: string): Promise<TwoFactorConfirmRes
   } catch (error) {
     return {
       ok: false,
-      error: extractErrorMessage(error, 'Unable to confirm 2FA.')
+      error: resolveAuthErrorMessage(error, 'Unable to confirm 2FA.')
     };
   }
 }
@@ -410,7 +689,7 @@ export async function disableTwoFactor(input: {
     const otp = String(input.otp || '').trim();
     const backupCode = String(input.backupCode || '').trim();
     if (!otp && !backupCode) {
-      return { ok: false, error: 'Please provide OTP or backup code.' };
+      return { ok: false, error: 'Enter a one-time code or backup code.' };
     }
 
     const response = await authRequest<DisableTwoFactorResponse>('/2fa/disable', {
@@ -430,7 +709,7 @@ export async function disableTwoFactor(input: {
   } catch (error) {
     return {
       ok: false,
-      error: extractErrorMessage(error, 'Unable to disable 2FA.')
+      error: resolveAuthErrorMessage(error, 'Unable to disable 2FA.')
     };
   }
 }
@@ -525,7 +804,61 @@ export async function changePassword(
   } catch (error) {
     return {
       ok: false,
-      error: extractErrorMessage(error, 'Unable to change password.')
+      error: resolveAuthErrorMessage(error, 'Unable to change password.')
+    };
+  }
+}
+
+export async function resetPasswordByOtp(input: {
+  email: string;
+  newPassword: string;
+  otpVerificationToken: string;
+}): Promise<ResetPasswordByOtpResult> {
+  const email = normalizeEmail(input.email);
+  const newPassword = String(input.newPassword || '');
+  const otpVerificationToken = String(input.otpVerificationToken || '').trim();
+
+  if (!validateEmail(email)) {
+    return {
+      ok: false,
+      error: 'Enter a valid email address.',
+    };
+  }
+  if (!newPassword) {
+    return {
+      ok: false,
+      error: 'Enter a new password.',
+    };
+  }
+  if (!otpVerificationToken) {
+    return {
+      ok: false,
+      error: 'Verify your email code before resetting your password.',
+    };
+  }
+
+  try {
+    const response = await authRequest<{ success?: boolean }>('/password/reset', {
+      method: 'POST',
+      body: JSON.stringify({
+        email,
+        newPassword,
+        otpVerificationToken,
+      }),
+    });
+
+    if (response && response.success === true) {
+      return { ok: true, success: true };
+    }
+
+    return {
+      ok: false,
+      error: 'Unable to reset password.',
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: resolveAuthErrorMessage(error, 'Unable to reset password.'),
     };
   }
 }
@@ -567,7 +900,10 @@ export function createAuthCompat() {
     signIn,
     exchangeOauthCode,
     verifyTwoFactorLogin,
+    sendEmailOtp,
+    verifyEmailOtp,
     registerUser,
+    resetPasswordByOtp,
     getCurrentUser,
     requireAuth,
     signOut,

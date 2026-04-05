@@ -1,10 +1,10 @@
 <!DOCTYPE html>
-<html lang="vi">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="google-signin-client-id" content="">
-    <title>Hello - Sign-Up</title>
+    <title>Hello - Sign Up</title>
     <link rel="stylesheet" href="../src/pages/landing/landingpage.css">
     <link rel="stylesheet" href="../src/pages/signup/auth.css">
 </head>
@@ -20,19 +20,19 @@
         <div class="auth-card">
             <div class="auth-header">
                 <img src="../Resources/Logo.png" alt="Logo" class="mini-logo">
-                <h2 id="auth-title">Join the Galaxy</h2>
-                <p id="auth-subtitle">Start organizing your constellations.</p>
+                <h2 id="auth-title">Create your account</h2>
+                <p id="auth-subtitle">Sign up with email or Google and go straight to your workspace.</p>
             </div>
 
             <form id="auth-form">
                 <div class="input-group">
-                    <input type="text" id="first-name" placeholder="First Name" aria-label="First Name" required>
+                    <input type="text" id="first-name" placeholder="First name" aria-label="First name" required>
                 </div>
                 <div class="input-group">
-                    <input type="text" id="last-name" placeholder="Last Name (Optional)" aria-label="Last Name">
+                    <input type="text" id="last-name" placeholder="Last name (optional)" aria-label="Last name">
                 </div>
                 <div class="input-group">
-                    <input type="email" id="email" placeholder="Email Address" aria-label="Email Address" required>
+                    <input type="email" id="email" placeholder="Email address" aria-label="Email address" required>
                 </div>
                 <div id="email-error" class="error-message"></div>
                 <div class="input-group">
@@ -51,14 +51,14 @@
                         <li id="policy-number">A number</li>
                     </ul>
                 </div>
-                <button type="submit" id="submit-btn" class="btn primary full-width">Create Universe</button>
+                <button type="submit" id="submit-btn" class="btn primary full-width">Create Account</button>
                 <div class="social-divider" aria-hidden="true"><span>or</span></div>
                 <div id="google-signup-container" class="google-auth-container"></div>
                 <div id="google-signup-error" class="error-message" aria-live="polite"></div>
             </form>
 
             <div class="auth-footer">
-                <span>Already a star?</span>
+                <span>Already have an account?</span>
                 <a href="../signin/">Sign In</a>
             </div>
         </div>

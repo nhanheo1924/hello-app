@@ -1,5 +1,12 @@
 import { SavedViewType } from "@prisma/client";
-import { IsBoolean, IsEnum, IsObject, IsOptional, IsString, MaxLength } from "class-validator";
+import {
+  IsBoolean,
+  IsEnum,
+  IsObject,
+  IsOptional,
+  IsString,
+  MaxLength,
+} from "class-validator";
 
 export class UpdateSavedViewDto {
   @IsOptional()

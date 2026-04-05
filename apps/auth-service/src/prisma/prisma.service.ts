@@ -62,7 +62,9 @@ export class PrismaService
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  private parseDatabaseTarget(rawDatabaseUrl: string | undefined): DatabaseTarget {
+  private parseDatabaseTarget(
+    rawDatabaseUrl: string | undefined,
+  ): DatabaseTarget {
     const value = String(rawDatabaseUrl || '').trim();
     if (!value) {
       return {
@@ -101,6 +103,21 @@ export class PrismaService
       return;
     }
 
+    const allowDockerDatabaseHosts = String(
+      process.env.ALLOW_DOCKER_DATABASE_HOSTS || '',
+    )
+      .trim()
+      .toLowerCase();
+    if (
+      allowDockerDatabaseHosts === 'true' ||
+      allowDockerDatabaseHosts === '1'
+    ) {
+      this.logger.warn(
+        'Skipping direct-host DB validation because ALLOW_DOCKER_DATABASE_HOSTS is enabled.',
+      );
+      return;
+    }
+
     if (!this.databaseTarget.parsed) {
       this.logger.warn(
         'DATABASE_URL is missing or invalid; skipping direct-host validation.',
@@ -121,9 +138,7 @@ export class PrismaService
       );
     }
 
-    const requiredPort = String(
-      process.env.DB_REQUIRED_PORT || '5432',
-    ).trim();
+    const requiredPort = String(process.env.DB_REQUIRED_PORT || '5432').trim();
     if (
       requiredPort &&
       this.databaseTarget.port &&

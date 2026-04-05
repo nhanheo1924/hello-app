@@ -94,7 +94,11 @@ function ensureRoot(): HTMLDivElement {
   spinner.setAttribute('aria-hidden', 'true');
 
   const text = document.createElement('span');
-  text.textContent = 'Loading...';
+  const loadingText =
+    window.OrbitI18n && typeof window.OrbitI18n.t === 'function'
+      ? window.OrbitI18n.t('Loading...')
+      : 'Loading...';
+  text.textContent = loadingText;
 
   root.appendChild(spinner);
   root.appendChild(text);
@@ -219,4 +223,3 @@ export function beginGlobalLoading(options: LoadingStartOptions = {}): LoadingSt
     }
   };
 }
-

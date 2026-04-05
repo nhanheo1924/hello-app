@@ -1,4 +1,10 @@
-import { IsISO8601, IsOptional, IsString, IsUUID, MaxLength } from "class-validator";
+import {
+  IsISO8601,
+  IsOptional,
+  IsString,
+  IsUUID,
+  MaxLength,
+} from "class-validator";
 import { PaginationQueryDto } from "./pagination-query.dto";
 
 export class ActivityQueryDto extends PaginationQueryDto {

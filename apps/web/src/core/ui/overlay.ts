@@ -175,7 +175,10 @@ export function showToast(message: string, timeoutMs = 2800): void {
 
   const toast = document.createElement('div');
   toast.className = 'ctm-toast';
-  toast.textContent = message;
+  toast.textContent =
+    window.OrbitI18n && typeof window.OrbitI18n.t === 'function'
+      ? window.OrbitI18n.t(message)
+      : message;
   stack.appendChild(toast);
 
   requestAnimationFrame(() => {
@@ -203,8 +206,16 @@ export function openDialog(options: DialogOptions): Promise<DialogResult> {
     return Promise.resolve({ confirmed: false, closed: true });
   }
 
-  titleNode.textContent = options.title || (options.type === 'confirm' ? 'Confirm' : 'Message');
-  bodyNode.textContent = options.message;
+  const translate = (value: string): string => (
+    window.OrbitI18n && typeof window.OrbitI18n.t === 'function'
+      ? window.OrbitI18n.t(value)
+      : value
+  );
+
+  titleNode.textContent = translate(
+    options.title || (options.type === 'confirm' ? 'Confirm' : 'Message')
+  );
+  bodyNode.textContent = translate(options.message);
   actionsNode.innerHTML = '';
 
   root.classList.add('is-open');
@@ -220,13 +231,13 @@ export function openDialog(options: DialogOptions): Promise<DialogResult> {
       const cancelButton = document.createElement('button');
       cancelButton.type = 'button';
       cancelButton.className = 'ctm-overlay-btn';
-      cancelButton.textContent = options.cancelLabel || 'Cancel';
+      cancelButton.textContent = translate(options.cancelLabel || 'Cancel');
       cancelButton.addEventListener('click', () => close(false));
 
       const confirmButton = document.createElement('button');
       confirmButton.type = 'button';
       confirmButton.className = 'ctm-overlay-btn primary';
-      confirmButton.textContent = options.confirmLabel || 'Confirm';
+      confirmButton.textContent = translate(options.confirmLabel || 'Confirm');
       confirmButton.addEventListener('click', () => close(true));
 
       actionsNode.append(cancelButton, confirmButton);
@@ -234,7 +245,7 @@ export function openDialog(options: DialogOptions): Promise<DialogResult> {
       const okButton = document.createElement('button');
       okButton.type = 'button';
       okButton.className = 'ctm-overlay-btn primary';
-      okButton.textContent = options.confirmLabel || 'OK';
+      okButton.textContent = translate(options.confirmLabel || 'OK');
       okButton.addEventListener('click', () => close(true));
       actionsNode.append(okButton);
     }

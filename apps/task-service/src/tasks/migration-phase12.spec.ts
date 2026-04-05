@@ -15,7 +15,8 @@ describe("phase1-2 migration backfill", () => {
     expect(sql).toMatch(/SET owner_user_id = created_by_user_id/i);
     expect(sql).toMatch(/SET updated_by_user_id = created_by_user_id/i);
     expect(sql).toMatch(/INSERT INTO project_settings/i);
-    expect(sql).toMatch(/SET completed_at = COALESCE\(completed_at, updated_at\)/i);
+    expect(sql).toMatch(
+      /SET completed_at = COALESCE\(completed_at, updated_at\)/i,
+    );
   });
 });
-

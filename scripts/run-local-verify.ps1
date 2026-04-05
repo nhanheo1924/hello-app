@@ -130,7 +130,7 @@ try {
     throw 'auth-service did not become ready within timeout'
   }
 
-  if (-not (Wait-HttpReady -Url 'http://localhost:3102/api/health/ready' -Timeout $TimeoutSec)) {
+  if (-not (Wait-HttpReady -Url 'http://localhost:3002/api/health/ready' -Timeout $TimeoutSec)) {
     throw 'task-service did not become ready within timeout'
   }
 

@@ -26,6 +26,7 @@ import {
   ReportOverviewQueryDto,
 } from "./dto/report-query.dto";
 import { SearchQueryDto } from "./dto/search-query.dto";
+import { PaginationQueryDto } from "./dto/pagination-query.dto";
 import { UpdateSavedViewDto } from "./dto/update-saved-view.dto";
 import { TasksService } from "./tasks.service";
 
@@ -33,6 +34,34 @@ import { TasksService } from "./tasks.service";
 @UseGuards(JwtAuthGuard)
 export class GovernanceController {
   constructor(private readonly tasksService: TasksService) {}
+
+  @Get("admin/workspaces")
+  listAdminWorkspaces(
+    @CurrentUser("systemRole") systemRole: string | undefined,
+    @Query() query: PaginationQueryDto,
+  ) {
+    return this.tasksService.listAdminWorkspaces(
+      systemRole,
+      query.page,
+      query.limit,
+    );
+  }
+
+  @Get("admin/users/:userId/workspace-ownership")
+  getAdminUserWorkspaceOwnership(
+    @CurrentUser("systemRole") systemRole: string | undefined,
+    @Param("userId") userId: string,
+  ) {
+    return this.tasksService.adminGetUserWorkspaceOwnership(systemRole, userId);
+  }
+
+  @Post("admin/users/:userId/cleanup")
+  cleanupAdminUserWorkspaceData(
+    @CurrentUser("systemRole") systemRole: string | undefined,
+    @Param("userId") userId: string,
+  ) {
+    return this.tasksService.adminCleanupUserWorkspaceData(systemRole, userId);
+  }
 
   @Patch("projects/:projectId/archive")
   archiveProject(
@@ -89,7 +118,12 @@ export class GovernanceController {
     @Param("workspaceId") workspaceId: string,
     @Query() query: SearchQueryDto,
   ) {
-    return this.tasksService.searchWorkspace(userId, systemRole, workspaceId, query);
+    return this.tasksService.searchWorkspace(
+      userId,
+      systemRole,
+      workspaceId,
+      query,
+    );
   }
 
   @Get("workspaces/:workspaceId/saved-views")
@@ -123,7 +157,12 @@ export class GovernanceController {
     @Param("savedViewId") savedViewId: string,
     @Body() dto: UpdateSavedViewDto,
   ) {
-    return this.tasksService.updateSavedView(userId, systemRole, savedViewId, dto);
+    return this.tasksService.updateSavedView(
+      userId,
+      systemRole,
+      savedViewId,
+      dto,
+    );
   }
 
   @Delete("saved-views/:savedViewId")
@@ -141,7 +180,11 @@ export class GovernanceController {
     @CurrentUser("systemRole") systemRole: string | undefined,
     @Param("workspaceId") workspaceId: string,
   ) {
-    return this.tasksService.listProjectTemplates(userId, systemRole, workspaceId);
+    return this.tasksService.listProjectTemplates(
+      userId,
+      systemRole,
+      workspaceId,
+    );
   }
 
   @Post("workspaces/:workspaceId/templates")
@@ -180,7 +223,11 @@ export class GovernanceController {
     @CurrentUser("systemRole") systemRole: string | undefined,
     @Param("templateId") templateId: string,
   ) {
-    return this.tasksService.deleteProjectTemplate(userId, systemRole, templateId);
+    return this.tasksService.deleteProjectTemplate(
+      userId,
+      systemRole,
+      templateId,
+    );
   }
 
   @Post("workspaces/:workspaceId/projects/from-template")
@@ -244,7 +291,10 @@ export class GovernanceController {
       query,
     );
     response.setHeader("content-type", "text/csv; charset=utf-8");
-    response.setHeader("content-disposition", `attachment; filename="${filename}"`);
+    response.setHeader(
+      "content-disposition",
+      `attachment; filename="${filename}"`,
+    );
     response.status(200).send(csv);
   }
 }

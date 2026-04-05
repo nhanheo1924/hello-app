@@ -1,4 +1,8 @@
-﻿import { ProjectStatus, ProjectViewType, ProjectVisibility } from "@prisma/client";
+﻿import {
+  ProjectStatus,
+  ProjectViewType,
+  ProjectVisibility,
+} from "@prisma/client";
 import { IsEnum, IsOptional, IsString, MaxLength } from "class-validator";
 
 export class UpdateProjectDto {

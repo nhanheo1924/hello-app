@@ -19,7 +19,9 @@ export interface PublicUser {
 
 export interface AuthResponse {
   accessToken: string;
+  refreshToken: string;
   expiresIn: number;
+  refreshExpiresIn: number;
   session: {
     sid: string;
   };

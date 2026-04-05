@@ -1,4 +1,4 @@
-﻿DO $$
+DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'system_role') THEN
     CREATE TYPE system_role AS ENUM ('SUPER_ADMIN', 'SYSTEM_ADMIN', 'USER');

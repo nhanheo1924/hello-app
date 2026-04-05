@@ -1,9 +1,9 @@
-import { Injectable } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
+import { Injectable } from "@nestjs/common";
+import { ConfigService } from "@nestjs/config";
 
 interface DownstreamHealthState {
-  auth: 'ready' | 'unavailable';
-  task: 'ready' | 'unavailable';
+  auth: "ready" | "unavailable";
+  task: "ready" | "unavailable";
 }
 
 @Injectable()
@@ -16,17 +16,17 @@ export class HealthService {
   }> {
     const authReadyUrl = this.buildReadyUrl(
       this.configService.get<string>(
-        'AUTH_SERVICE_BASE_URL',
-        'http://localhost:3000/api/auth',
+        "AUTH_SERVICE_BASE_URL",
+        "http://localhost:3000/api/auth",
       ),
-      'auth',
+      "auth",
     );
     const taskReadyUrl = this.buildReadyUrl(
       this.configService.get<string>(
-        'TASK_SERVICE_BASE_URL',
-        'http://localhost:3102/api',
+        "TASK_SERVICE_BASE_URL",
+        "http://localhost:3002/api",
       ),
-      'task',
+      "task",
     );
 
     const [authReady, taskReady] = await Promise.all([
@@ -37,22 +37,24 @@ export class HealthService {
     return {
       ready: authReady && taskReady,
       downstream: {
-        auth: authReady ? 'ready' : 'unavailable',
-        task: taskReady ? 'ready' : 'unavailable',
+        auth: authReady ? "ready" : "unavailable",
+        task: taskReady ? "ready" : "unavailable",
       },
     };
   }
 
-  private buildReadyUrl(baseUrl: string, kind: 'auth' | 'task'): string {
-    const normalized = String(baseUrl || '').trim().replace(/\/+$/, '');
+  private buildReadyUrl(baseUrl: string, kind: "auth" | "task"): string {
+    const normalized = String(baseUrl || "")
+      .trim()
+      .replace(/\/+$/, "");
     if (!normalized) {
-      return kind === 'auth'
-        ? 'http://localhost:3000/api/health/ready'
-        : 'http://localhost:3102/api/health/ready';
+      return kind === "auth"
+        ? "http://localhost:3000/api/health/ready"
+        : "http://localhost:3002/api/health/ready";
     }
 
-    if (kind === 'auth' && normalized.endsWith('/auth')) {
-      return `${normalized.slice(0, -'/auth'.length)}/health/ready`;
+    if (kind === "auth" && normalized.endsWith("/auth")) {
+      return `${normalized.slice(0, -"/auth".length)}/health/ready`;
     }
 
     return `${normalized}/health/ready`;
@@ -65,7 +67,7 @@ export class HealthService {
 
     try {
       const response = await fetch(url, {
-        method: 'GET',
+        method: "GET",
         signal: controller.signal,
       });
       return response.ok;

@@ -18,7 +18,8 @@ function Invoke-JsonApi {
     [string]$Method,
     [string]$Url,
     [hashtable]$Headers = @{},
-    [object]$Body = $null
+    [object]$Body = $null,
+    [Microsoft.PowerShell.Commands.WebRequestSession]$WebSession = $null
   )
 
   $mergedHeaders = @{}
@@ -34,6 +35,9 @@ function Invoke-JsonApi {
     Uri = $Url
     Headers = $mergedHeaders
     ErrorAction = 'Stop'
+  }
+  if ($null -ne $WebSession) {
+    $requestParams['WebSession'] = $WebSession
   }
 
   if ($null -ne $Body) {
@@ -77,36 +81,30 @@ Write-Host '1) Register and login test user...'
 $suffix = [Guid]::NewGuid().ToString('N').Substring(0, 8)
 $email = "authflow-$suffix@example.com"
 $password = 'CtmLocal2026!'
+$session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
 
 $null = Invoke-JsonApi -Method 'POST' -Url "$BffApiBase/auth/signup" -Body @{
   email = $email
   password = $password
   fullName = 'Auth Flow Verify'
-}
+} -WebSession $session
 
 $loginInitial = Invoke-JsonApi -Method 'POST' -Url "$BffApiBase/auth/login" -Body @{
   email = $email
   password = $password
-}
-
-$accessToken = [string]$loginInitial.accessToken
-if ([string]::IsNullOrWhiteSpace($accessToken)) {
-  throw 'Initial login failed: missing access token.'
-}
-
-$authHeaders = @{ Authorization = "Bearer $accessToken" }
+} -WebSession $session
 
 Write-Host '2) Start 2FA setup and confirm with OTP...'
-$setup = Invoke-JsonApi -Method 'POST' -Url "$BffApiBase/auth/2fa/setup" -Headers $authHeaders
+$setup = Invoke-JsonApi -Method 'POST' -Url "$BffApiBase/auth/2fa/setup" -WebSession $session
 $secret = [string]$setup.secret
 if ([string]::IsNullOrWhiteSpace($secret)) {
   throw '2FA setup failed: missing secret.'
 }
 
 $confirmOtp = New-TotpCode -Secret $secret
-$confirm = Invoke-JsonApi -Method 'POST' -Url "$BffApiBase/auth/2fa/confirm" -Headers $authHeaders -Body @{
+$confirm = Invoke-JsonApi -Method 'POST' -Url "$BffApiBase/auth/2fa/confirm" -Body @{
   otp = $confirmOtp
-}
+} -WebSession $session
 
 $backupCodes = @()
 if ($confirm.backupCodes) {
@@ -117,10 +115,11 @@ if ($backupCodes.Count -eq 0) {
 }
 
 Write-Host '3) Ensure password login now requires 2FA challenge...'
+$challengeSession = New-Object Microsoft.PowerShell.Commands.WebRequestSession
 $login2faRequired = Invoke-JsonApi -Method 'POST' -Url "$BffApiBase/auth/login" -Body @{
   email = $email
   password = $password
-}
+} -WebSession $challengeSession
 
 $requiresTwoFactor = $login2faRequired.requiresTwoFactor -eq $true
 $twoFactorToken = [string]$login2faRequired.twoFactorToken
@@ -133,32 +132,34 @@ $verifyOtp = New-TotpCode -Secret $secret
 $verify = Invoke-JsonApi -Method 'POST' -Url "$BffApiBase/auth/2fa/verify-login" -Body @{
   otp = $verifyOtp
   twoFactorToken = $twoFactorToken
-}
-
-$verifiedAccessToken = [string]$verify.accessToken
-if ([string]::IsNullOrWhiteSpace($verifiedAccessToken)) {
-  throw '2FA verify login failed: missing access token.'
-}
-
-$verifiedHeaders = @{ Authorization = "Bearer $verifiedAccessToken" }
+} -WebSession $challengeSession
 
 Write-Host '5) Disable 2FA using backup code...'
-$disable = Invoke-JsonApi -Method 'POST' -Url "$BffApiBase/auth/2fa/disable" -Headers $verifiedHeaders -Body @{
+$disable = Invoke-JsonApi -Method 'POST' -Url "$BffApiBase/auth/2fa/disable" -Body @{
   backupCode = [string]$backupCodes[0]
-}
+} -WebSession $challengeSession
 
 if (-not ($disable.success -eq $true)) {
   throw 'Disable 2FA failed.'
 }
 
 Write-Host '6) Ensure login works without 2FA after disable...'
+$finalSession = New-Object Microsoft.PowerShell.Commands.WebRequestSession
 $loginAfterDisable = Invoke-JsonApi -Method 'POST' -Url "$BffApiBase/auth/login" -Body @{
   email = $email
   password = $password
+} -WebSession $finalSession
+
+$me = Invoke-JsonApi -Method 'GET' -Url "$BffApiBase/auth/me" -WebSession $finalSession
+$meUserId = ''
+if ($me.user -and $me.user.id) {
+  $meUserId = [string]$me.user.id
+} elseif ($me.id) {
+  $meUserId = [string]$me.id
 }
 
-if ([string]::IsNullOrWhiteSpace([string]$loginAfterDisable.accessToken)) {
-  throw 'Expected normal access token after disabling 2FA.'
+if ([string]::IsNullOrWhiteSpace($meUserId)) {
+  throw 'Expected cookie session after login, but /auth/me did not return user id.'
 }
 
 Write-Host '7) Check OAuth start endpoint redirect...'

@@ -1,9 +1,10 @@
 import {
   IsEmail,
-  IsOptional,
   IsString,
   Matches,
   MaxLength,
+  MinLength,
+  IsOptional,
 } from 'class-validator';
 
 export class RegisterDto {
@@ -15,6 +16,11 @@ export class RegisterDto {
     message: 'password must be 8-64 chars and include upper, lower and number',
   })
   password!: string;
+
+  @IsString()
+  @MinLength(16)
+  @MaxLength(256)
+  otpVerificationToken!: string;
 
   @IsOptional()
   @IsString()

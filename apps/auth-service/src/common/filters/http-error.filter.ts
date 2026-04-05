@@ -23,6 +23,7 @@ const STATUS_CODE_MAP: Record<number, string> = {
   [HttpStatus.CONFLICT]: 'CONFLICT',
   [HttpStatus.TOO_MANY_REQUESTS]: 'RATE_LIMITED',
 };
+const TOO_MANY_REQUESTS_STATUS = 429;
 
 @Catch()
 export class HttpErrorFilter implements ExceptionFilter {
@@ -34,11 +35,16 @@ export class HttpErrorFilter implements ExceptionFilter {
 
     const status = this.resolveStatus(exception);
     const body = this.resolveBody(exception, status);
+    const retryAfterSeconds = this.resolveRetryAfterSeconds(exception, status);
 
     if (!(exception instanceof HttpException)) {
       this.logger.error(
         exception instanceof Error ? exception.stack : String(exception),
       );
+    }
+
+    if (retryAfterSeconds > 0) {
+      response.setHeader('Retry-After', String(retryAfterSeconds));
     }
 
     response.status(status).json(body);
@@ -56,7 +62,10 @@ export class HttpErrorFilter implements ExceptionFilter {
     if (exception instanceof HttpException) {
       const response = exception.getResponse();
       if (typeof response === 'string') {
-        return this.toErrorEnvelope(response, this.defaultCodeForStatus(status));
+        return this.toErrorEnvelope(
+          response,
+          this.defaultCodeForStatus(status),
+        );
       }
 
       if (response && typeof response === 'object') {
@@ -115,5 +124,38 @@ export class HttpErrorFilter implements ExceptionFilter {
           code,
           details,
         };
+  }
+
+  private resolveRetryAfterSeconds(exception: unknown, status: number): number {
+    if (status !== TOO_MANY_REQUESTS_STATUS) {
+      return 0;
+    }
+
+    if (!(exception instanceof HttpException)) {
+      return 0;
+    }
+
+    const rawResponse = exception.getResponse();
+    if (!rawResponse || typeof rawResponse !== 'object') {
+      return 0;
+    }
+
+    const record = rawResponse as {
+      retryAfterSeconds?: unknown;
+      details?: {
+        retryAfterSeconds?: unknown;
+      };
+    };
+    const direct = Number(record.retryAfterSeconds);
+    if (Number.isFinite(direct) && direct > 0) {
+      return Math.floor(direct);
+    }
+
+    const nested = Number(record.details?.retryAfterSeconds);
+    if (Number.isFinite(nested) && nested > 0) {
+      return Math.floor(nested);
+    }
+
+    return 0;
   }
 }

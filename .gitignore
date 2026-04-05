@@ -8,3 +8,9 @@ node_modules
 !**/.env.example
 **/*.log
 .vercel
+.codex
+.codex/
+.tmp
+.tmp/
+public/
+**/public/

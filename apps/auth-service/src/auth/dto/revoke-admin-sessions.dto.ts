@@ -5,4 +5,3 @@ export class RevokeAdminSessionsDto {
   @IsUUID()
   sessionId?: string;
 }
-

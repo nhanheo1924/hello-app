@@ -7,8 +7,10 @@ import { HttpErrorFilter } from './common/filters/http-error.filter';
 import { ProxySecretGuard } from './common/guards/proxy-secret.guard';
 import { RequestLoggingInterceptor } from './common/interceptors/request-logging.interceptor';
 import { envValidationSchema } from './config/env.validation';
+import { EmailModule } from './email/email.module';
 import { HealthModule } from './health/health.module';
 import { PrismaModule } from './prisma/prisma.module';
+import { RedisModule } from './redis/redis.module';
 import { UsersModule } from './users/users.module';
 
 @Module({
@@ -23,6 +25,8 @@ import { UsersModule } from './users/users.module';
         limit: 60,
       },
     ]),
+    RedisModule,
+    EmailModule,
     PrismaModule,
     UsersModule,
     AuthModule,

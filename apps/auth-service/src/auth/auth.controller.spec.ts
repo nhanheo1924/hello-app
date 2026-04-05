@@ -9,7 +9,10 @@ describe('AuthController', () => {
 
   const authServiceMock = {
     register: jest.fn(),
+    sendEmailOTP: jest.fn(),
+    verifyEmailOTP: jest.fn(),
     login: jest.fn(),
+    refreshSession: jest.fn(),
     verifyTwoFactorLogin: jest.fn(),
     beginTwoFactorSetup: jest.fn(),
     confirmTwoFactorSetup: jest.fn(),
@@ -22,6 +25,7 @@ describe('AuthController', () => {
     loginWithGoogleAuthCode: jest.fn(),
     getProfile: jest.fn(),
     updateProfile: jest.fn(),
+    resetPasswordWithOtp: jest.fn(),
     getAdminSecurityDashboard: jest.fn(),
     listAdminUsers: jest.fn(),
     updateAdminUserStatus: jest.fn(),
@@ -75,7 +79,9 @@ describe('AuthController', () => {
     };
     authServiceMock.login.mockResolvedValue({
       accessToken: 'access-token',
+      refreshToken: 'refresh-token',
       expiresIn: 900,
+      refreshExpiresIn: 2592000,
       session: { sid: 'sid-1' },
       user,
     });
@@ -111,7 +117,9 @@ describe('AuthController', () => {
     );
     expect(result).toEqual({
       accessToken: 'access-token',
+      refreshToken: 'refresh-token',
       expiresIn: 900,
+      refreshExpiresIn: 2592000,
       session: { sid: 'sid-1' },
       user: expect.objectContaining({
         id: 'u1',
@@ -143,7 +151,10 @@ describe('AuthController', () => {
     };
     const result = await controller.adminUsers('admin-1', query as any);
 
-    expect(authServiceMock.listAdminUsers).toHaveBeenCalledWith('admin-1', query);
+    expect(authServiceMock.listAdminUsers).toHaveBeenCalledWith(
+      'admin-1',
+      query,
+    );
     expect(result).toEqual({
       data: [{ id: 'u1', email: 'a@example.com' }],
       meta: { page: 1, limit: 20, total: 1, totalPages: 1 },
@@ -155,11 +166,9 @@ describe('AuthController', () => {
       data: { id: 'u2', status: 'LOCKED' },
     });
 
-    const result = await controller.adminUpdateUserStatus(
-      'admin-1',
-      'u2',
-      { status: 'LOCKED' } as any,
-    );
+    const result = await controller.adminUpdateUserStatus('admin-1', 'u2', {
+      status: 'LOCKED',
+    } as any);
 
     expect(authServiceMock.updateAdminUserStatus).toHaveBeenCalledWith(
       'admin-1',
@@ -176,11 +185,9 @@ describe('AuthController', () => {
       data: { revoked: 1 },
     });
 
-    const result = await controller.adminRevokeUserSessions(
-      'admin-1',
-      'u2',
-      { sessionId: 'sid-2' } as any,
-    );
+    const result = await controller.adminRevokeUserSessions('admin-1', 'u2', {
+      sessionId: 'sid-2',
+    } as any);
 
     expect(authServiceMock.revokeAdminUserSessions).toHaveBeenCalledWith(
       'admin-1',

@@ -106,6 +106,7 @@ model Workspace {
   status       WorkspaceStatus   @default(ACTIVE)
   createdAt    DateTime          @default(now()) @map("created_at")
   updatedAt    DateTime          @updatedAt @map("updated_at")
+  settings     WorkspaceSetting?
   members      WorkspaceMember[]
   projects     Project[]
   labels       Label[]
@@ -117,6 +118,21 @@ model Workspace {
   @@index([ownerUserId])
   @@index([status])
   @@map("workspaces")
+}
+
+model WorkspaceSetting {
+  workspaceId           String    @id @map("workspace_id") @db.Uuid
+  startDate             DateTime? @map("start_date") @db.Date
+  endDate               DateTime? @map("end_date") @db.Date
+  hourFormat            String    @default("24") @map("hour_format") @db.VarChar(2)
+  showWeekends          Boolean   @default(true) @map("show_weekends")
+  weekStart             String    @default("mon") @map("week_start") @db.VarChar(3)
+  defaultDurationHours  Float     @default(2) @map("default_duration_hours")
+  createdAt             DateTime  @default(now()) @map("created_at")
+  updatedAt             DateTime  @updatedAt @map("updated_at")
+  workspace             Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@map("workspace_settings")
 }
 
 model WorkspaceMember {

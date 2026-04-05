@@ -3,6 +3,7 @@ import {
   Controller,
   Delete,
   Get,
+  Headers,
   Param,
   Patch,
   Post,
@@ -20,6 +21,7 @@ import { CreateWorkspaceDto } from "./dto/create-workspace.dto";
 import { PaginationQueryDto } from "./dto/pagination-query.dto";
 import { UpdateMemberRoleDto } from "./dto/update-member-role.dto";
 import { UpdateWorkspaceDto } from "./dto/update-workspace.dto";
+import { UpdateWorkspaceSettingsDto } from "./dto/update-workspace-settings.dto";
 import { TasksService } from "./tasks.service";
 
 @Controller("workspaces")
@@ -58,6 +60,23 @@ export class WorkspacesController {
     @Body() dto: UpdateWorkspaceDto,
   ) {
     return this.tasksService.updateWorkspace(userId, workspaceId, dto);
+  }
+
+  @Get(":workspaceId/settings")
+  getSettings(
+    @CurrentUser("userId") userId: string,
+    @Param("workspaceId") workspaceId: string,
+  ) {
+    return this.tasksService.getWorkspaceSettings(userId, workspaceId);
+  }
+
+  @Patch(":workspaceId/settings")
+  updateSettings(
+    @CurrentUser("userId") userId: string,
+    @Param("workspaceId") workspaceId: string,
+    @Body() dto: UpdateWorkspaceSettingsDto,
+  ) {
+    return this.tasksService.updateWorkspaceSettings(userId, workspaceId, dto);
   }
 
   @Delete(":workspaceId")
@@ -105,7 +124,11 @@ export class WorkspacesController {
     @Param("workspaceId") workspaceId: string,
     @Body() dto: AddMemberByEmailDto,
   ) {
-    return this.tasksService.addWorkspaceMemberByEmail(userId, workspaceId, dto);
+    return this.tasksService.addWorkspaceMemberByEmail(
+      userId,
+      workspaceId,
+      dto,
+    );
   }
 
   @Patch(":workspaceId/members/:memberUserId/role")
@@ -129,7 +152,11 @@ export class WorkspacesController {
     @Param("workspaceId") workspaceId: string,
     @Param("memberUserId") memberUserId: string,
   ) {
-    return this.tasksService.removeWorkspaceMember(userId, workspaceId, memberUserId);
+    return this.tasksService.removeWorkspaceMember(
+      userId,
+      workspaceId,
+      memberUserId,
+    );
   }
 
   @Get(":workspaceId/board")
@@ -168,12 +195,14 @@ export class WorkspacesController {
     @CurrentUser("systemRole") systemRole: string | undefined,
     @Param("workspaceId") workspaceId: string,
     @Body() dto: CreateTaskDto,
+    @Headers("idempotency-key") idempotencyKey?: string,
   ) {
     return this.tasksService.createWorkspaceTask(
       userId,
       systemRole,
       workspaceId,
       dto,
+      idempotencyKey,
     );
   }
 }

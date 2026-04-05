@@ -16,7 +16,7 @@ jest.mock("../src/auth/jwks.service", () => ({
 }));
 
 /* eslint-disable @typescript-eslint/no-require-imports */
-// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+
 const { AppModule } = require("../src/app.module");
 /* eslint-enable @typescript-eslint/no-require-imports */
 

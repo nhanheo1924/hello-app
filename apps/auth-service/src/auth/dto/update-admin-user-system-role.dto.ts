@@ -5,4 +5,3 @@ export class UpdateAdminUserSystemRoleDto {
   @IsEnum(SystemRole)
   systemRole!: SystemRole;
 }
-

@@ -16,6 +16,8 @@ type AdminRealtimeStatus = 'connected' | 'reconnecting' | 'offline';
 
 type AdminRealtimeHandlers = {
   onInvalidate?: (payload: unknown) => void;
+  onEvent?: (payload: unknown) => void;
+  onDelta?: (payload: unknown) => void;
   onStatusChange?: (status: AdminRealtimeStatus) => void;
   onError?: (payload: unknown) => void;
 };
@@ -318,21 +320,29 @@ export async function listAdminAuditLogs(query: QueryParams = {}) {
   );
 }
 
+export async function deleteAdminUser(userId: string) {
+  return requestAuth<{ data: { id: string; deleted: true } }>(
+    `/admin/users/${encodeURIComponent(userId)}`,
+    { method: 'DELETE' },
+  );
+}
+
+export async function listAdminWorkspaces(query: QueryParams = {}) {
+  return requestTask<{ data: unknown[]; meta: unknown }>(
+    `/admin/workspaces${toQueryString(query)}`,
+    { method: 'GET' },
+  );
+}
+
 function buildAdminRealtimeUrl(): URL {
-  const apiBase = new URL(API_BASE_URL, window.location.origin);
-  const wsUrl = new URL(apiBase.toString());
-  wsUrl.protocol = apiBase.protocol === 'https:' ? 'wss:' : 'ws:';
-  wsUrl.pathname = `${apiBase.pathname.replace(/\/+$/, '')}/sync/ws`;
-  wsUrl.search = '';
-  wsUrl.searchParams.set('scope', 'admin');
-  wsUrl.searchParams.set('workspaceId', '*');
-  return wsUrl;
+  const streamUrl = new URL(`${API_BASE_URL}/sync/stream`, window.location.origin);
+  streamUrl.searchParams.set('scope', 'admin');
+  streamUrl.searchParams.set('workspaceId', '*');
+  return streamUrl;
 }
 
 export function connectAdminRealtime(handlers: AdminRealtimeHandlers = {}) {
-  let socket: WebSocket | null = null;
-  let reconnectTimer: number | null = null;
-  let reconnectAttempt = 0;
+  let source: EventSource | null = null;
   let disconnected = false;
   let status: AdminRealtimeStatus = 'offline';
 
@@ -342,73 +352,44 @@ export function connectAdminRealtime(handlers: AdminRealtimeHandlers = {}) {
     handlers.onStatusChange?.(next);
   };
 
-  const clearReconnectTimer = () => {
-    if (reconnectTimer !== null) {
-      window.clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-    }
-  };
-
-  const scheduleReconnect = () => {
-    if (disconnected) return;
-    clearReconnectTimer();
-    reconnectAttempt += 1;
-    const delay = Math.min(30_000, 1_000 * (2 ** Math.max(0, reconnectAttempt - 1)));
-    reconnectTimer = window.setTimeout(() => {
-      reconnectTimer = null;
-      connect();
-    }, delay);
-  };
-
   const connect = () => {
     if (disconnected) return;
     try {
-      const wsUrl = buildAdminRealtimeUrl();
+      const streamUrl = buildAdminRealtimeUrl();
       setStatus('reconnecting');
-      socket = new WebSocket(wsUrl.toString());
+      source = new EventSource(streamUrl.toString(), {
+        withCredentials: true,
+      });
     } catch (error) {
       handlers.onError?.(error);
-      scheduleReconnect();
+      setStatus('offline');
       return;
     }
 
-    socket.onopen = () => {
-      reconnectAttempt = 0;
+    source.onopen = () => {
       setStatus('connected');
     };
 
-    socket.onmessage = (event) => {
-      let parsed: Record<string, unknown> | null = null;
-      try {
-        parsed = JSON.parse(String(event.data || '{}')) as Record<string, unknown>;
-      } catch {
-        parsed = null;
-      }
-      if (!parsed || typeof parsed !== 'object') return;
+    source.addEventListener('sync.status', () => {
+      setStatus('connected');
+    });
+    source.addEventListener('sync.invalidate', (event) => {
+      handlers.onInvalidate?.(safeParseEventData(event));
+    });
+    source.addEventListener('admin.event', (event) => {
+      handlers.onEvent?.(safeParseEventData(event));
+    });
+    source.addEventListener('admin.delta', (event) => {
+      handlers.onDelta?.(safeParseEventData(event));
+    });
 
-      const eventName = typeof parsed.event === 'string' ? parsed.event : '';
-      const payload = parsed.data;
-      if (eventName === 'sync.invalidate') {
-        handlers.onInvalidate?.(payload);
-      } else if (eventName === 'sync.error') {
-        handlers.onError?.(payload);
-      } else if (eventName === 'sync.status') {
-        setStatus('connected');
-      }
-    };
-
-    socket.onclose = () => {
-      socket = null;
+    source.onerror = () => {
       if (disconnected) {
         setStatus('offline');
         return;
       }
       setStatus('reconnecting');
-      scheduleReconnect();
-    };
-
-    socket.onerror = () => {
-      handlers.onError?.({ message: 'Admin realtime socket error' });
+      handlers.onError?.({ message: 'Admin realtime stream disconnected' });
     };
   };
 
@@ -416,10 +397,9 @@ export function connectAdminRealtime(handlers: AdminRealtimeHandlers = {}) {
 
   return () => {
     disconnected = true;
-    clearReconnectTimer();
-    if (socket) {
-      socket.close();
-      socket = null;
+    if (source) {
+      source.close();
+      source = null;
     }
     setStatus('offline');
   };
@@ -456,6 +436,8 @@ export function createGovernanceApiCompat() {
     listAdminUserSessions,
     revokeAdminUserSessions,
     listAdminAuditLogs,
+    deleteAdminUser,
+    listAdminWorkspaces,
     connectAdminRealtime,
   };
 }

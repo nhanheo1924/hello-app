@@ -3,9 +3,31 @@ import { getStoredUser } from '../../core/auth/session';
 import { API_BASE_URL } from '../../config/api';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const TASK_AUTH_FAILURE_EVENT = 'orbit:task-auth-failure';
+const TASK_AUTH_SUCCESS_EVENT = 'orbit:task-auth-success';
+const SESSION_ERROR_CODES = new Set([
+  'AUTH_UNAUTHORIZED',
+  'SESSION_REVOKED',
+  'REFRESH_TOKEN_MISSING',
+  'REFRESH_INVALID',
+  'REFRESH_EXPIRED',
+  'REFRESH_REUSED',
+  'TOKEN_INVALID',
+  'TOKEN_EXPIRED',
+]);
 
 type WorkspaceRequestOptions = {
   workspaceId?: string;
+  idempotencyKey?: string;
+};
+
+type TaskAuthEventDetail = {
+  source: 'task-api';
+  status: number;
+  code: string;
+  path: string;
+  method: string;
+  ts: number;
 };
 
 function resolveWorkspaceHeader(workspaceId?: string): string {
@@ -102,17 +124,105 @@ async function request<T>(
   if (workspaceHeader) {
     headers.set('x-workspace-id', workspaceHeader);
   }
+  const idempotencyKey = String(requestOptions.idempotencyKey || '').trim();
+  if (idempotencyKey) {
+    headers.set('idempotency-key', idempotencyKey);
+  }
 
-  return httpRequest<T>(`${API_BASE_URL}${path}`, {
-    ...options,
-    headers,
-    credentials: 'include',
-  });
+  const method = String(options.method || 'GET').toUpperCase();
+  const normalizedPath = String(path || '').trim() || '/';
+  try {
+    const result = await httpRequest<T>(`${API_BASE_URL}${path}`, {
+      ...options,
+      headers,
+      credentials: 'include',
+    });
+    emitTaskAuthSuccess(normalizedPath, method);
+    return result;
+  } catch (error) {
+    emitTaskAuthFailure(error, normalizedPath, method);
+    throw error;
+  }
 }
 
 function getSessionHintToken(): string | null {
   const storedUser = getStoredUser();
   return storedUser ? 'cookie-session' : null;
+}
+
+function emitTaskAuthSuccess(path: string, method: string): void {
+  emitWindowEvent(TASK_AUTH_SUCCESS_EVENT, {
+    source: 'task-api',
+    status: 200,
+    code: '',
+    path,
+    method,
+    ts: Date.now(),
+  });
+}
+
+function emitTaskAuthFailure(
+  error: unknown,
+  path: string,
+  method: string,
+): void {
+  const status = readErrorStatus(error);
+  const code = readErrorCode(error);
+  const isSessionError = SESSION_ERROR_CODES.has(code);
+
+  if (!isSessionError) {
+    return;
+  }
+
+  const detail: TaskAuthEventDetail = {
+    source: 'task-api',
+    status,
+    code,
+    path,
+    method,
+    ts: Date.now(),
+  };
+  emitWindowEvent(TASK_AUTH_FAILURE_EVENT, detail);
+}
+
+function readErrorStatus(error: unknown): number {
+  if (!error || typeof error !== 'object') {
+    return 0;
+  }
+  const status = Number((error as { status?: unknown }).status);
+  return Number.isFinite(status) ? status : 0;
+}
+
+function readErrorCode(error: unknown): string {
+  if (!error || typeof error !== 'object') {
+    return '';
+  }
+
+  const body = (error as { body?: unknown }).body;
+  if (!body || typeof body !== 'object') {
+    return '';
+  }
+
+  const code = (body as { code?: unknown }).code;
+  return typeof code === 'string' ? code.trim().toUpperCase() : '';
+}
+
+function emitWindowEvent(name: string, detail: TaskAuthEventDetail): void {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  if (typeof window.dispatchEvent !== 'function') {
+    return;
+  }
+  if (typeof CustomEvent !== 'function') {
+    return;
+  }
+
+  try {
+    window.dispatchEvent(new CustomEvent(name, { detail }));
+  } catch {
+    // ignore unsupported browser environments
+  }
 }
 
 export async function listWorkspaces(page?: number, limit?: number) {
@@ -124,6 +234,20 @@ export async function listWorkspaces(page?: number, limit?: number) {
     data: Array.isArray(body.data) ? body.data : [],
     meta: body.meta || null,
   };
+}
+
+export async function getWorkspace(
+  workspaceId: string,
+  requestOptions: WorkspaceRequestOptions = {},
+) {
+  const body = await request<{ data?: unknown }>(
+    `/workspaces/${encodeURIComponent(workspaceId)}`,
+    {
+      method: 'GET',
+    },
+    requestOptions,
+  );
+  return body.data || null;
 }
 
 export async function createWorkspace(payload: unknown) {
@@ -141,6 +265,36 @@ export async function updateWorkspace(
 ) {
   const body = await request<{ data?: unknown }>(
     `/workspaces/${encodeURIComponent(workspaceId)}`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify(payload || {}),
+    },
+    requestOptions,
+  );
+  return body.data || null;
+}
+
+export async function getWorkspaceSettings(
+  workspaceId: string,
+  requestOptions: WorkspaceRequestOptions = {},
+) {
+  const body = await request<{ data?: unknown }>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/settings`,
+    {
+      method: 'GET',
+    },
+    requestOptions,
+  );
+  return body.data || null;
+}
+
+export async function updateWorkspaceSettings(
+  workspaceId: string,
+  payload: unknown,
+  requestOptions: WorkspaceRequestOptions = {},
+) {
+  const body = await request<{ data?: unknown }>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/settings`,
     {
       method: 'PATCH',
       body: JSON.stringify(payload || {}),
@@ -538,8 +692,11 @@ export function createTaskApiCompat() {
     getToken: getSessionHintToken,
     request,
     listWorkspaces,
+    getWorkspace,
     createWorkspace,
     updateWorkspace,
+    getWorkspaceSettings,
+    updateWorkspaceSettings,
     deleteWorkspace,
     ensureWorkspace,
     listProjects,

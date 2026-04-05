@@ -5,8 +5,8 @@ import {
   HttpException,
   HttpStatus,
   Logger,
-} from '@nestjs/common';
-import { Response } from 'express';
+} from "@nestjs/common";
+import { Response } from "express";
 
 interface ErrorEnvelope {
   code: string;
@@ -44,21 +44,21 @@ export class HttpErrorFilter implements ExceptionFilter {
   private resolveBody(exception: unknown, status: number): ErrorEnvelope {
     if (exception instanceof HttpException) {
       const response = exception.getResponse();
-      if (typeof response === 'string') {
+      if (typeof response === "string") {
         return {
           code: this.defaultCodeForStatus(status),
           message: response,
         };
       }
 
-      if (response && typeof response === 'object') {
+      if (response && typeof response === "object") {
         const raw = response as {
           code?: unknown;
           message?: unknown;
           details?: unknown;
         };
 
-        if (typeof raw.code === 'string' && typeof raw.message === 'string') {
+        if (typeof raw.code === "string" && typeof raw.message === "string") {
           return raw.details === undefined
             ? { code: raw.code, message: raw.message }
             : { code: raw.code, message: raw.message, details: raw.details };
@@ -66,13 +66,13 @@ export class HttpErrorFilter implements ExceptionFilter {
 
         if (Array.isArray(raw.message)) {
           return {
-            code: 'VALIDATION_ERROR',
-            message: 'Validation failed',
+            code: "VALIDATION_ERROR",
+            message: "Validation failed",
             details: raw.message,
           };
         }
 
-        if (typeof raw.message === 'string') {
+        if (typeof raw.message === "string") {
           return {
             code: this.defaultCodeForStatus(status),
             message: raw.message,
@@ -82,31 +82,31 @@ export class HttpErrorFilter implements ExceptionFilter {
     }
 
     return {
-      code: 'INTERNAL_ERROR',
-      message: 'Internal server error',
+      code: "INTERNAL_ERROR",
+      message: "Internal server error",
     };
   }
 
   private defaultCodeForStatus(status: number): string {
     switch (status) {
       case 400:
-        return 'BAD_REQUEST';
+        return "BAD_REQUEST";
       case 401:
-        return 'UNAUTHORIZED';
+        return "UNAUTHORIZED";
       case 403:
-        return 'FORBIDDEN';
+        return "FORBIDDEN";
       case 404:
-        return 'NOT_FOUND';
+        return "NOT_FOUND";
       case 409:
-        return 'CONFLICT';
+        return "CONFLICT";
       case 429:
-        return 'RATE_LIMITED';
+        return "RATE_LIMITED";
       case 502:
-        return 'BAD_GATEWAY';
+        return "BAD_GATEWAY";
       case 504:
-        return 'GATEWAY_TIMEOUT';
+        return "GATEWAY_TIMEOUT";
       default:
-        return 'INTERNAL_ERROR';
+        return "INTERNAL_ERROR";
     }
   }
 }

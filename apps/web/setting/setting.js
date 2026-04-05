@@ -66,7 +66,7 @@ async function bootstrapSettingPage() {
     if (rangePreviewEl) rangePreviewEl.textContent = '\u2014 days selected';
     const langSelectEl = document.getElementById('langSelect');
     if (langSelectEl) {
-        const langMap = { vi: 'Tieng Viet', ja: 'Japanese', fr: 'Francais' };
+        const langMap = { en: 'English', vi: 'Vietnamese' };
         [...langSelectEl.options].forEach((opt) => {
             if (langMap[opt.value]) opt.textContent = langMap[opt.value];
         });
@@ -394,16 +394,31 @@ async function bootstrapSettingPage() {
     }
 
     const WORKSPACE_MEMBER_ROLES = ['ADMIN', 'MEMBER', 'VIEWER'];
+    const MEMBER_INVITEABLE_WORKSPACE_ROLES = ['MEMBER', 'VIEWER'];
     const workspaceMemberState = {
         workspaceId: '',
         members: [],
-        canManage: false,
+        canInvite: false,
+        canEditRoles: false,
+        canRemoveMembers: false,
+        inviteRoles: [],
+        permissionContext: {
+            systemRole: 'USER',
+            workspaceRole: null,
+            projectRole: null
+        },
         loading: false
     };
     const workspaceIdFromQuery = new URLSearchParams(window.location.search).get('workspaceId') || '';
     if (isUuid(workspaceIdFromQuery)) {
         workspaceMemberState.workspaceId = workspaceIdFromQuery;
     }
+    const workspaceSettingsState = {
+        workspaceId: workspaceMemberState.workspaceId,
+        visible: isUuid(workspaceIdFromQuery),
+        loading: false,
+        name: ''
+    };
 
     function normalizeEmailInput(value) {
         const email = String(value || '').trim().toLowerCase();
@@ -434,14 +449,110 @@ async function bootstrapSettingPage() {
         };
     }
 
-    function systemCanManageWorkspaceMembers() {
-        const systemRole = typeof user?.systemRole === 'string'
-            ? user.systemRole.trim().toUpperCase()
-            : 'USER';
-        return systemRole === 'SUPER_ADMIN' || systemRole === 'SYSTEM_ADMIN';
+    function resolveWorkspacePermissionContext(members) {
+        const currentUserId = typeof user?.id === 'string' ? user.id : '';
+        const currentMember = currentUserId && Array.isArray(members)
+            ? members.find((member) => member && member.userId === currentUserId)
+            : null;
+        return {
+            systemRole: typeof user?.systemRole === 'string' ? user.systemRole : 'USER',
+            workspaceRole: typeof currentMember?.role === 'string' ? currentMember.role : null,
+            projectRole: null
+        };
+    }
+
+    function canInviteWorkspaceMembers(context) {
+        if (
+            window.OrbitPermissions &&
+            typeof window.OrbitPermissions.canInviteWorkspaceMembers === 'function'
+        ) {
+            return window.OrbitPermissions.canInviteWorkspaceMembers(context);
+        }
+        const systemRole = typeof context?.systemRole === 'string'
+            ? context.systemRole.trim().toUpperCase()
+            : '';
+        if (systemRole === 'SUPER_ADMIN' || systemRole === 'SYSTEM_ADMIN') {
+            return true;
+        }
+        const workspaceRole = typeof context?.workspaceRole === 'string'
+            ? context.workspaceRole.trim().toUpperCase()
+            : '';
+        return workspaceRole === 'OWNER' || workspaceRole === 'ADMIN' || workspaceRole === 'MEMBER';
+    }
+
+    function canEditWorkspaceMemberRoles(context) {
+        if (
+            window.OrbitPermissions &&
+            typeof window.OrbitPermissions.canEditWorkspaceMemberRoles === 'function'
+        ) {
+            return window.OrbitPermissions.canEditWorkspaceMemberRoles(context);
+        }
+        const systemRole = typeof context?.systemRole === 'string'
+            ? context.systemRole.trim().toUpperCase()
+            : '';
+        if (systemRole === 'SUPER_ADMIN' || systemRole === 'SYSTEM_ADMIN') {
+            return true;
+        }
+        const workspaceRole = typeof context?.workspaceRole === 'string'
+            ? context.workspaceRole.trim().toUpperCase()
+            : '';
+        return workspaceRole === 'OWNER' || workspaceRole === 'ADMIN';
+    }
+
+    function canRemoveWorkspaceMembers(context) {
+        if (
+            window.OrbitPermissions &&
+            typeof window.OrbitPermissions.canRemoveWorkspaceMembers === 'function'
+        ) {
+            return window.OrbitPermissions.canRemoveWorkspaceMembers(context);
+        }
+        return canEditWorkspaceMemberRoles(context);
+    }
+
+    function getWorkspaceInviteRoleOptions(context) {
+        if (
+            window.OrbitPermissions &&
+            typeof window.OrbitPermissions.getWorkspaceInviteRoleOptions === 'function'
+        ) {
+            const roles = window.OrbitPermissions.getWorkspaceInviteRoleOptions(context);
+            return Array.isArray(roles)
+                ? roles.filter((role) => WORKSPACE_MEMBER_ROLES.includes(String(role)))
+                : [];
+        }
+        const systemRole = typeof context?.systemRole === 'string'
+            ? context.systemRole.trim().toUpperCase()
+            : '';
+        if (systemRole === 'SUPER_ADMIN' || systemRole === 'SYSTEM_ADMIN') {
+            return [...WORKSPACE_MEMBER_ROLES];
+        }
+        const workspaceRole = typeof context?.workspaceRole === 'string'
+            ? context.workspaceRole.trim().toUpperCase()
+            : '';
+        if (workspaceRole === 'OWNER' || workspaceRole === 'ADMIN') {
+            return [...WORKSPACE_MEMBER_ROLES];
+        }
+        if (workspaceRole === 'MEMBER') {
+            return [...MEMBER_INVITEABLE_WORKSPACE_ROLES];
+        }
+        return [];
+    }
+
+    function canAssignWorkspaceInviteRole(context, role) {
+        if (
+            window.OrbitPermissions &&
+            typeof window.OrbitPermissions.canAssignWorkspaceInviteRole === 'function'
+        ) {
+            return window.OrbitPermissions.canAssignWorkspaceInviteRole(context, role);
+        }
+        const normalizedRole = normalizeRoleValue(role);
+        if (normalizedRole === 'OWNER') {
+            return false;
+        }
+        return getWorkspaceInviteRoleOptions(context).includes(normalizedRole);
     }
 
     function ensureWorkspaceMembersUI() {
+        if (!workspaceSettingsState.visible) return null;
         const workspaceTab = document.getElementById('tab-workspace');
         if (!workspaceTab) return null;
 
@@ -578,10 +689,29 @@ async function bootstrapSettingPage() {
         const emailInput = document.getElementById('workspaceMemberEmailInput');
 
         if (!list || !addBtn || !refreshBtn || !roleSelect || !emailInput) return;
-        addBtn.disabled = !workspaceMemberState.canManage || workspaceMemberState.loading;
+        const inviteDisabled = workspaceMemberState.loading ||
+            !workspaceMemberState.canInvite ||
+            workspaceMemberState.inviteRoles.length === 0;
+        addBtn.disabled = inviteDisabled;
         refreshBtn.disabled = workspaceMemberState.loading;
-        roleSelect.disabled = !workspaceMemberState.canManage || workspaceMemberState.loading;
-        emailInput.disabled = !workspaceMemberState.canManage || workspaceMemberState.loading;
+        roleSelect.disabled = inviteDisabled;
+        emailInput.disabled = inviteDisabled;
+        roleSelect.innerHTML = '';
+        if (workspaceMemberState.inviteRoles.length === 0) {
+            const option = document.createElement('option');
+            option.value = '';
+            option.textContent = 'No roles available';
+            option.disabled = true;
+            option.selected = true;
+            roleSelect.appendChild(option);
+        } else {
+            workspaceMemberState.inviteRoles.forEach((role) => {
+                const option = document.createElement('option');
+                option.value = role;
+                option.textContent = role;
+                roleSelect.appendChild(option);
+            });
+        }
 
         list.innerHTML = '';
         if (workspaceMemberState.members.length === 0) {
@@ -624,7 +754,7 @@ async function bootstrapSettingPage() {
                 roleEditor.appendChild(option);
             });
             roleEditor.value = identityData.role;
-            roleEditor.disabled = identityData.isOwner || !workspaceMemberState.canManage || workspaceMemberState.loading;
+            roleEditor.disabled = identityData.isOwner || !workspaceMemberState.canEditRoles || workspaceMemberState.loading;
             row.appendChild(roleEditor);
 
             if (identityData.isOwner) {
@@ -634,11 +764,17 @@ async function bootstrapSettingPage() {
                 return;
             }
 
+            if (!workspaceMemberState.canEditRoles) {
+                roleEditor.disabled = true;
+                list.appendChild(row);
+                return;
+            }
+
             const saveRoleBtn = document.createElement('button');
             saveRoleBtn.type = 'button';
             saveRoleBtn.className = 'step-btn';
             saveRoleBtn.textContent = 'Update';
-            saveRoleBtn.disabled = identityData.isOwner || !workspaceMemberState.canManage || workspaceMemberState.loading;
+            saveRoleBtn.disabled = identityData.isOwner || !workspaceMemberState.canEditRoles || workspaceMemberState.loading;
             saveRoleBtn.addEventListener('click', async () => {
                 if (!workspaceMemberState.workspaceId || !isUuid(identityData.userId)) return;
                 if (normalizeRoleValue(roleEditor.value) === normalizeRoleValue(identityData.role)) {
@@ -678,7 +814,7 @@ async function bootstrapSettingPage() {
             removeBtn.style.minWidth = '32px';
             removeBtn.style.padding = '0';
             removeBtn.style.borderRadius = '999px';
-            removeBtn.disabled = identityData.isOwner || !workspaceMemberState.canManage || workspaceMemberState.loading;
+            removeBtn.disabled = identityData.isOwner || !workspaceMemberState.canRemoveMembers || workspaceMemberState.loading;
             removeBtn.addEventListener('click', async () => {
                 if (!workspaceMemberState.workspaceId || !isUuid(identityData.userId)) return;
                 const confirmed = await confirmWorkspaceAction(
@@ -707,33 +843,31 @@ async function bootstrapSettingPage() {
     }
 
     async function resolveWorkspaceForMembers() {
-        if (!window.OrbitTaskApi || typeof window.OrbitTaskApi.ensureWorkspace !== 'function') {
-            return '';
-        }
         if (workspaceMemberState.workspaceId && isUuid(workspaceMemberState.workspaceId)) {
             return workspaceMemberState.workspaceId;
         }
-
-        const workspace = await window.OrbitTaskApi.ensureWorkspace('My Workspace');
-        const workspaceId = workspace && typeof workspace.id === 'string' ? workspace.id : '';
-        workspaceMemberState.workspaceId = isUuid(workspaceId) ? workspaceId : '';
-        return workspaceMemberState.workspaceId;
+        return '';
     }
 
-    function computeWorkspaceManagePermission(members) {
-        if (systemCanManageWorkspaceMembers()) {
-            return true;
-        }
-        const currentUserId = typeof user?.id === 'string' ? user.id : '';
-        if (!currentUserId || !Array.isArray(members)) {
-            return false;
-        }
-        const currentMember = members.find((member) => member && member.userId === currentUserId);
-        const role = typeof currentMember?.role === 'string' ? currentMember.role.toUpperCase() : '';
-        return role === 'OWNER' || role === 'ADMIN';
+    function applyWorkspaceMemberPermissions(members) {
+        const context = resolveWorkspacePermissionContext(members);
+        workspaceMemberState.permissionContext = context;
+        workspaceMemberState.canInvite = canInviteWorkspaceMembers(context);
+        workspaceMemberState.canEditRoles = canEditWorkspaceMemberRoles(context);
+        workspaceMemberState.canRemoveMembers = canRemoveWorkspaceMembers(context);
+        workspaceMemberState.inviteRoles = getWorkspaceInviteRoleOptions(context);
     }
 
     async function refreshWorkspaceMembers() {
+        if (!workspaceSettingsState.visible) {
+            workspaceMemberState.members = [];
+            workspaceMemberState.canInvite = false;
+            workspaceMemberState.canEditRoles = false;
+            workspaceMemberState.canRemoveMembers = false;
+            workspaceMemberState.inviteRoles = [];
+            workspaceMemberState.loading = false;
+            return;
+        }
         ensureWorkspaceMembersUI();
         workspaceMemberState.loading = true;
         renderWorkspaceMembers();
@@ -742,16 +876,22 @@ async function bootstrapSettingPage() {
             const workspaceId = await resolveWorkspaceForMembers();
             if (!workspaceId) {
                 workspaceMemberState.members = [];
-                workspaceMemberState.canManage = false;
+                workspaceMemberState.canInvite = false;
+                workspaceMemberState.canEditRoles = false;
+                workspaceMemberState.canRemoveMembers = false;
+                workspaceMemberState.inviteRoles = [];
                 return;
             }
 
             const members = await window.OrbitTaskApi.listWorkspaceMembers(workspaceId);
             workspaceMemberState.members = Array.isArray(members) ? members : [];
-            workspaceMemberState.canManage = computeWorkspaceManagePermission(workspaceMemberState.members);
+            applyWorkspaceMemberPermissions(workspaceMemberState.members);
         } catch (error) {
             workspaceMemberState.members = [];
-            workspaceMemberState.canManage = false;
+            workspaceMemberState.canInvite = false;
+            workspaceMemberState.canEditRoles = false;
+            workspaceMemberState.canRemoveMembers = false;
+            workspaceMemberState.inviteRoles = [];
             console.warn('Unable to load workspace members:', error);
         } finally {
             workspaceMemberState.loading = false;
@@ -762,7 +902,11 @@ async function bootstrapSettingPage() {
     async function addWorkspaceMemberFromSettings() {
         const emailInput = document.getElementById('workspaceMemberEmailInput');
         const roleSelect = document.getElementById('workspaceMemberRoleSelect');
-        if (!emailInput || !roleSelect || !workspaceMemberState.canManage) return;
+        if (!emailInput || !roleSelect) return;
+        if (!workspaceMemberState.canInvite) {
+            showToast('You do not have permission to invite members');
+            return;
+        }
 
         const email = normalizeEmailInput(emailInput.value);
         if (!email) {
@@ -770,7 +914,11 @@ async function bootstrapSettingPage() {
             return;
         }
 
-        const role = WORKSPACE_MEMBER_ROLES.includes(roleSelect.value) ? roleSelect.value : 'MEMBER';
+        const role = normalizeRoleValue(roleSelect.value);
+        if (!canAssignWorkspaceInviteRole(workspaceMemberState.permissionContext, role)) {
+            showToast('Selected role is not allowed for your workspace permission');
+            return;
+        }
         try {
             const workspaceId = await resolveWorkspaceForMembers();
             if (!workspaceId) {
@@ -851,6 +999,19 @@ async function bootstrapSettingPage() {
         return true;
     }
 
+    function setWorkspaceTabVisibility(visible) {
+        const workspaceTabButton = document.querySelector('.tab[data-tab="workspace"]');
+        const workspacePanel = document.getElementById('tab-workspace');
+        if (workspaceTabButton) {
+            workspaceTabButton.style.display = visible ? '' : 'none';
+            workspaceTabButton.setAttribute('aria-hidden', visible ? 'false' : 'true');
+            workspaceTabButton.tabIndex = visible ? 0 : -1;
+        }
+        if (workspacePanel) {
+            workspacePanel.hidden = !visible;
+        }
+    }
+
     function getTabFromHash() {
         const hash = window.location.hash || '';
         if (!hash.startsWith('#tab-')) return '';
@@ -865,14 +1026,25 @@ async function bootstrapSettingPage() {
         });
     });
 
+    setWorkspaceTabVisibility(workspaceSettingsState.visible);
+
     const initialTab = getTabFromHash();
-    if (initialTab) {
+    if (initialTab && (initialTab !== 'workspace' || workspaceSettingsState.visible)) {
         activateTab(initialTab);
+    } else if (workspaceSettingsState.visible) {
+        activateTab('workspace');
+        history.replaceState(
+            null,
+            '',
+            `${window.location.pathname}${window.location.search}#tab-workspace`
+        );
     }
 
     window.addEventListener('hashchange', () => {
         const tabKey = getTabFromHash();
-        if (tabKey) activateTab(tabKey);
+        if (tabKey && (tabKey !== 'workspace' || workspaceSettingsState.visible)) {
+            activateTab(tabKey);
+        }
     });
 
     function showToast(msg, duration = 2200) {
@@ -976,6 +1148,123 @@ async function bootstrapSettingPage() {
         };
     }
 
+    function getDefaultWorkspaceTimelineSettings() {
+        return {
+            startDate: '',
+            endDate: '',
+            hourFormat: '24',
+            showWeekends: true,
+            weekStart: 'mon',
+            defaultDuration: 2
+        };
+    }
+
+    function normalizeWorkspaceDuration(value, fallback = 2) {
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric)) {
+            return fallback;
+        }
+        const normalized = Math.round(numeric * 2) / 2;
+        return Math.max(0.5, Math.min(12, normalized));
+    }
+
+    function normalizeWorkspaceTimelineSettings(source = {}, fallback = {}) {
+        const defaults = getDefaultWorkspaceTimelineSettings();
+        const nextSource = source && typeof source === 'object' ? source : {};
+        const nextFallback = fallback && typeof fallback === 'object' ? fallback : {};
+        const durationSource = nextSource.defaultDurationHours !== undefined
+            ? nextSource.defaultDurationHours
+            : nextSource.defaultDuration;
+        const durationFallback = nextFallback.defaultDurationHours !== undefined
+            ? nextFallback.defaultDurationHours
+            : nextFallback.defaultDuration;
+
+        return {
+            startDate: isISODate(nextSource.startDate)
+                ? nextSource.startDate
+                : (isISODate(nextFallback.startDate) ? nextFallback.startDate : defaults.startDate),
+            endDate: isISODate(nextSource.endDate)
+                ? nextSource.endDate
+                : (isISODate(nextFallback.endDate) ? nextFallback.endDate : defaults.endDate),
+            hourFormat: nextSource.hourFormat === '12'
+                ? '12'
+                : (nextSource.hourFormat === '24'
+                    ? '24'
+                    : (nextFallback.hourFormat === '12' ? '12' : defaults.hourFormat)),
+            showWeekends: typeof nextSource.showWeekends === 'boolean'
+                ? nextSource.showWeekends
+                : (typeof nextFallback.showWeekends === 'boolean'
+                    ? nextFallback.showWeekends
+                    : defaults.showWeekends),
+            weekStart: nextSource.weekStart === 'sun'
+                ? 'sun'
+                : (nextSource.weekStart === 'mon'
+                    ? 'mon'
+                    : (nextFallback.weekStart === 'sun' ? 'sun' : defaults.weekStart)),
+            defaultDuration: normalizeWorkspaceDuration(
+                durationSource,
+                normalizeWorkspaceDuration(durationFallback, defaults.defaultDuration)
+            )
+        };
+    }
+
+    function mergeWorkspaceTimelineIntoSettings(baseSettings, source = {}, fallback = {}) {
+        const resolvedBase = baseSettings && typeof baseSettings === 'object'
+            ? baseSettings
+            : sanitizeSettings({});
+        const timeline = normalizeWorkspaceTimelineSettings(
+            source,
+            fallback && typeof fallback === 'object'
+                ? fallback
+                : resolvedBase.timeline
+        );
+
+        return {
+            ...resolvedBase,
+            timeline: {
+                ...resolvedBase.timeline,
+                startDate: timeline.startDate,
+                endDate: timeline.endDate,
+                hourFormat: timeline.hourFormat,
+                showWeekends: timeline.showWeekends,
+                weekStart: timeline.weekStart,
+                defaultDuration: timeline.defaultDuration
+            }
+        };
+    }
+
+    function buildWorkspaceTimelinePayload(settings) {
+        const timeline = normalizeWorkspaceTimelineSettings(
+            settings && typeof settings === 'object' ? settings.timeline : {}
+        );
+        return {
+            startDate: timeline.startDate || null,
+            endDate: timeline.endDate || null,
+            hourFormat: timeline.hourFormat,
+            showWeekends: timeline.showWeekends,
+            weekStart: timeline.weekStart,
+            defaultDurationHours: timeline.defaultDuration
+        };
+    }
+
+    function extractLocalSettingsForStorage(settings) {
+        const resolved = settings && typeof settings === 'object'
+            ? settings
+            : getDefaultSettings();
+        return {
+            appearance: resolved.appearance,
+            notifications: resolved.notifications,
+            account: resolved.account
+        };
+    }
+
+    function persistLocalSettings(settings) {
+        localStorage.setItem(
+            SETTINGS_KEY,
+            JSON.stringify(extractLocalSettingsForStorage(settings))
+        );
+    }
+
     function sanitizeSettings(raw) {
         const defaults = getDefaultSettings();
         const timeline = raw && typeof raw === 'object' && raw.timeline && typeof raw.timeline === 'object' ? raw.timeline : {};
@@ -1016,7 +1305,11 @@ async function bootstrapSettingPage() {
                 weeklyReport: typeof notifications.weeklyReport === 'boolean' ? notifications.weeklyReport : defaults.notifications.weeklyReport
             },
             account: {
-                language: typeof account.language === 'string' && account.language.trim() ? account.language : defaults.account.language,
+                language:
+                    typeof account.language === 'string' &&
+                    ['en', 'vi'].includes(account.language.trim().toLowerCase())
+                        ? account.language.trim().toLowerCase()
+                        : defaults.account.language,
                 timezone: sanitizeTimezone(account.timezone, defaults.account.timezone),
                 autoSave: typeof account.autoSave === 'boolean' ? account.autoSave : defaults.account.autoSave,
                 avatarDataUrl: sanitizeImageUrl(account.avatarDataUrl)
@@ -1030,7 +1323,14 @@ async function bootstrapSettingPage() {
     let currentAuthProfile = liveProfile || storedProfile || user;
 
     let workingSettings = sanitizeSettings(parsedSettings);
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(workingSettings));
+    if (workspaceSettingsState.visible) {
+        workingSettings = mergeWorkspaceTimelineIntoSettings(
+            workingSettings,
+            getDefaultWorkspaceTimelineSettings(),
+            getDefaultWorkspaceTimelineSettings()
+        );
+    }
+    persistLocalSettings(workingSettings);
 
     const startDateEl = document.getElementById('startDate');
     const endDateEl = document.getElementById('endDate');
@@ -1249,22 +1549,34 @@ async function bootstrapSettingPage() {
         return d.toISOString().split('T')[0];
     }
 
+    function parseDateOnlyValue(value) {
+        if (!isISODate(value)) {
+            return null;
+        }
+        const [year, month, day] = value.split('-').map(Number);
+        const parsed = new Date(year, month - 1, day);
+        if (Number.isNaN(parsed.getTime())) {
+            return null;
+        }
+        return parsed;
+    }
+
     function updateRangePreview() {
-        const s = new Date(startDateEl.value);
-        const e = new Date(endDateEl.value);
+        const s = parseDateOnlyValue(startDateEl.value);
+        const e = parseDateOnlyValue(endDateEl.value);
         rangePreview.style.color = 'rgba(255,255,255,0.28)';
-        if (!isNaN(s) && !isNaN(e) && e >= s) {
+        if (s && e && e >= s) {
             const diff = Math.round((e - s) / 86400000) + 1;
             const opts = { month: 'short', day: 'numeric' };
             rangePreview.textContent = `${s.toLocaleDateString('en-US', opts)} -> ${e.toLocaleDateString('en-US', opts)}`;
             rangeBadge.textContent = `${diff}d`;
             rangeBadge.style.color = diff > 14 ? 'rgba(255,180,80,0.8)' : 'rgba(255,255,255,0.6)';
-        } else if (e < s) {
+        } else if (s && e && e < s) {
             rangePreview.textContent = 'End date must be after start';
             rangePreview.style.color = 'rgba(255,80,100,0.8)';
             rangeBadge.textContent = '!';
         } else {
-            rangePreview.textContent = '— days selected';
+            rangePreview.textContent = '\u2014 days selected';
             rangeBadge.textContent = '0d';
         }
     }
@@ -1358,7 +1670,7 @@ async function bootstrapSettingPage() {
     document.getElementById('removeBg').addEventListener('click', () => {
         workingSettings.appearance.bgDataUrl = '';
         document.getElementById('bgPreviewRow').style.display = 'none';
-        document.getElementById('bgFilename').textContent = '—';
+        document.getElementById('bgFilename').textContent = '\u2014';
         document.getElementById('bgUpload').value = '';
         updateBgDim();
         showToast('Background removed');
@@ -1444,16 +1756,16 @@ async function bootstrapSettingPage() {
         });
     }
 
-    function saveSettings() {
-        workingSettings = gatherSettings();
-        localStorage.setItem(SETTINGS_KEY, JSON.stringify(workingSettings));
+    function saveSettingsSnapshot(nextSettings) {
+        workingSettings = nextSettings;
+        persistLocalSettings(workingSettings);
     }
 
     function applySettingsToUI(settings) {
         workingSettings = settings;
 
-        if (settings.timeline.startDate) startDateEl.value = settings.timeline.startDate;
-        if (settings.timeline.endDate) endDateEl.value = settings.timeline.endDate;
+        startDateEl.value = settings.timeline.startDate || '';
+        endDateEl.value = settings.timeline.endDate || '';
         document.getElementById('showWeekends').checked = settings.timeline.showWeekends;
         document.getElementById('snapGrid').checked = settings.timeline.snapGrid;
         document.getElementById('overlapWarn').checked = settings.timeline.overlapWarn;
@@ -1484,7 +1796,10 @@ async function bootstrapSettingPage() {
         if (remIdx < 0) remIdx = 2;
         document.getElementById('remVal').textContent = `${remSteps[remIdx]}m`;
 
-        document.getElementById('langSelect').value = settings.account.language;
+        const resolvedLanguage = ['en', 'vi'].includes(settings.account.language)
+            ? settings.account.language
+            : 'en';
+        document.getElementById('langSelect').value = resolvedLanguage;
         document.getElementById('tzSelect').value = settings.account.timezone;
         document.getElementById('autoSave').checked = settings.account.autoSave;
 
@@ -1503,7 +1818,7 @@ async function bootstrapSettingPage() {
             document.getElementById('bgPreviewRow').style.display = 'flex';
         } else {
             document.getElementById('bgPreviewRow').style.display = 'none';
-            document.getElementById('bgFilename').textContent = '—';
+            document.getElementById('bgFilename').textContent = '\u2014';
         }
 
         updateBgDim();
@@ -1511,26 +1826,182 @@ async function bootstrapSettingPage() {
         renderProfileSummary();
     }
 
-    const defaultRange = getDefaultTimelineRange();
-    if (!workingSettings.timeline.startDate) workingSettings.timeline.startDate = defaultRange.startDate;
-    if (!workingSettings.timeline.endDate) workingSettings.timeline.endDate = defaultRange.endDate;
+    async function loadWorkspaceSettingsFromRemote(options = {}) {
+        if (!workspaceSettingsState.visible || !isUuid(workspaceSettingsState.workspaceId)) {
+            return false;
+        }
+        if (
+            !window.OrbitTaskApi ||
+            typeof window.OrbitTaskApi.getWorkspaceSettings !== 'function'
+        ) {
+            if (!options.silent) {
+                showToast('Workspace settings are unavailable');
+            }
+            return false;
+        }
+
+        workspaceSettingsState.loading = true;
+        try {
+            const requestOptions = { workspaceId: workspaceSettingsState.workspaceId };
+            const workspaceRequest = typeof window.OrbitTaskApi.getWorkspace === 'function'
+                ? window.OrbitTaskApi.getWorkspace(
+                    workspaceSettingsState.workspaceId,
+                    requestOptions
+                )
+                : Promise.resolve(null);
+            const [remoteSettings, workspace] = await Promise.all([
+                window.OrbitTaskApi.getWorkspaceSettings(
+                    workspaceSettingsState.workspaceId,
+                    requestOptions
+                ),
+                workspaceRequest
+            ]);
+
+            workspaceSettingsState.name = typeof workspace?.name === 'string'
+                ? workspace.name.trim()
+                : workspaceSettingsState.name;
+            workingSettings = mergeWorkspaceTimelineIntoSettings(
+                workingSettings,
+                remoteSettings || (workspace && workspace.settings) || getDefaultWorkspaceTimelineSettings(),
+                getDefaultWorkspaceTimelineSettings()
+            );
+            applySettingsToUI(workingSettings);
+            return true;
+        } catch (error) {
+            console.warn('Unable to load workspace settings:', error);
+            if (!options.silent) {
+                showToast('Unable to load workspace settings');
+            }
+            return false;
+        } finally {
+            workspaceSettingsState.loading = false;
+        }
+    }
+
+    async function saveWorkspaceSettingsToRemote(nextSettings) {
+        if (!workspaceSettingsState.visible || !isUuid(workspaceSettingsState.workspaceId)) {
+            return mergeWorkspaceTimelineIntoSettings(
+                nextSettings,
+                buildWorkspaceTimelinePayload(nextSettings),
+                getDefaultWorkspaceTimelineSettings()
+            );
+        }
+        if (
+            !window.OrbitTaskApi ||
+            typeof window.OrbitTaskApi.updateWorkspaceSettings !== 'function'
+        ) {
+            throw new Error('Workspace settings service is unavailable.');
+        }
+
+        const payload = buildWorkspaceTimelinePayload(nextSettings);
+        const savedSettings = await window.OrbitTaskApi.updateWorkspaceSettings(
+            workspaceSettingsState.workspaceId,
+            payload,
+            { workspaceId: workspaceSettingsState.workspaceId }
+        );
+        return mergeWorkspaceTimelineIntoSettings(
+            nextSettings,
+            savedSettings || payload,
+            payload
+        );
+    }
+
+    async function handleSaveSettingsButtonClick() {
+        const btn = document.getElementById('saveBtn');
+        if (!btn) return;
+
+        const previousLanguage = (
+            workingSettings &&
+            workingSettings.account &&
+            typeof workingSettings.account.language === 'string'
+        )
+            ? workingSettings.account.language.trim().toLowerCase()
+            : 'en';
+        const nextSettings = gatherSettings();
+        btn.disabled = true;
+
+        try {
+            let resolvedSettings = nextSettings;
+            if (workspaceSettingsState.visible) {
+                try {
+                    resolvedSettings = await saveWorkspaceSettingsToRemote(nextSettings);
+                } catch (error) {
+                    console.warn('Unable to save workspace settings:', error);
+                    const resynced = await loadWorkspaceSettingsFromRemote({ silent: true });
+                    const fallbackTimeline = resynced
+                        ? workingSettings.timeline
+                        : getDefaultWorkspaceTimelineSettings();
+                    resolvedSettings = mergeWorkspaceTimelineIntoSettings(
+                        nextSettings,
+                        fallbackTimeline,
+                        fallbackTimeline
+                    );
+                    saveSettingsSnapshot(resolvedSettings);
+                    applySettingsToUI(workingSettings);
+                    showToast('Local settings were saved, but workspace settings could not be updated');
+                    return;
+                }
+            }
+
+            saveSettingsSnapshot(resolvedSettings);
+            applySettingsToUI(workingSettings);
+            btn.classList.add('saved');
+            btn.innerHTML = '<span class="save-icon">\u2713</span> Saved!';
+
+            setTimeout(() => {
+                btn.classList.remove('saved');
+                btn.innerHTML = '<span class="save-icon">\u2726</span> Save Changes';
+            }, 1800);
+            showToast('Settings saved successfully');
+
+            const nextLanguage =
+                resolvedSettings &&
+                resolvedSettings.account &&
+                typeof resolvedSettings.account.language === 'string'
+                    ? resolvedSettings.account.language.trim().toLowerCase()
+                    : previousLanguage;
+            if (
+                window.OrbitI18n &&
+                typeof window.OrbitI18n.setLanguage === 'function' &&
+                ['en', 'vi'].includes(nextLanguage) &&
+                nextLanguage !== previousLanguage
+            ) {
+                window.OrbitI18n.setLanguage(nextLanguage, {
+                    persist: true,
+                    reload: true
+                });
+                return;
+            }
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    if (!workspaceSettingsState.visible) {
+        const defaultRange = getDefaultTimelineRange();
+        if (!workingSettings.timeline.startDate) workingSettings.timeline.startDate = defaultRange.startDate;
+        if (!workingSettings.timeline.endDate) workingSettings.timeline.endDate = defaultRange.endDate;
+    }
 
     applySettingsToUI(workingSettings);
 
-    ensureWorkspaceMembersUI();
-    const workspaceMemberAddBtn = document.getElementById('workspaceMemberAddBtn');
-    const workspaceMemberRefreshBtn = document.getElementById('workspaceMemberRefreshBtn');
-    if (workspaceMemberAddBtn) {
-        workspaceMemberAddBtn.addEventListener('click', () => {
-            void addWorkspaceMemberFromSettings();
-        });
+    if (workspaceSettingsState.visible) {
+        void loadWorkspaceSettingsFromRemote({ silent: true });
+        ensureWorkspaceMembersUI();
+        const workspaceMemberAddBtn = document.getElementById('workspaceMemberAddBtn');
+        const workspaceMemberRefreshBtn = document.getElementById('workspaceMemberRefreshBtn');
+        if (workspaceMemberAddBtn) {
+            workspaceMemberAddBtn.addEventListener('click', () => {
+                void addWorkspaceMemberFromSettings();
+            });
+        }
+        if (workspaceMemberRefreshBtn) {
+            workspaceMemberRefreshBtn.addEventListener('click', () => {
+                void refreshWorkspaceMembers();
+            });
+        }
+        void refreshWorkspaceMembers();
     }
-    if (workspaceMemberRefreshBtn) {
-        workspaceMemberRefreshBtn.addEventListener('click', () => {
-            void refreshWorkspaceMembers();
-        });
-    }
-    void refreshWorkspaceMembers();
 
     renderProfileSummary();
 
@@ -1761,16 +2232,7 @@ async function bootstrapSettingPage() {
     }
 
     document.getElementById('saveBtn').addEventListener('click', async () => {
-        saveSettings();
-        const btn = document.getElementById('saveBtn');
-        btn.classList.add('saved');
-        btn.innerHTML = '<span class="save-icon">✓</span> Saved!';
-
-        setTimeout(() => {
-            btn.classList.remove('saved');
-            btn.innerHTML = '<span class="save-icon">✦</span> Save Changes';
-        }, 1800);
-        showToast('Settings saved successfully');
+        await handleSaveSettingsButtonClick();
     });
 
     document.getElementById('exportBtn').addEventListener('click', async () => {
@@ -1814,8 +2276,33 @@ async function bootstrapSettingPage() {
             'Reset all settings to defaults?'
         );
         if (!confirmed) return;
-        workingSettings = getDefaultSettings();
-        localStorage.setItem(SETTINGS_KEY, JSON.stringify(workingSettings));
+        let nextSettings = getDefaultSettings();
+        if (workspaceSettingsState.visible) {
+            nextSettings = mergeWorkspaceTimelineIntoSettings(
+                nextSettings,
+                getDefaultWorkspaceTimelineSettings(),
+                getDefaultWorkspaceTimelineSettings()
+            );
+            try {
+                nextSettings = await saveWorkspaceSettingsToRemote(nextSettings);
+            } catch (error) {
+                console.warn('Unable to reset workspace settings:', error);
+                const resynced = await loadWorkspaceSettingsFromRemote({ silent: true });
+                const fallbackTimeline = resynced
+                    ? workingSettings.timeline
+                    : getDefaultWorkspaceTimelineSettings();
+                nextSettings = mergeWorkspaceTimelineIntoSettings(
+                    nextSettings,
+                    fallbackTimeline,
+                    fallbackTimeline
+                );
+                saveSettingsSnapshot(nextSettings);
+                applySettingsToUI(workingSettings);
+                showToast('Local settings were reset, but workspace settings could not be updated');
+                return;
+            }
+        }
+        saveSettingsSnapshot(nextSettings);
         applySettingsToUI(workingSettings);
         showToast('Settings reset to defaults');
     });
@@ -1841,3 +2328,4 @@ if (document.readyState === 'loading') {
 } else {
     void bootstrapSettingPage();
 }
+

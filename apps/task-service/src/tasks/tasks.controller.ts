@@ -30,8 +30,15 @@ export class TasksController {
     @CurrentUser("systemRole") systemRole: string | undefined,
     @Param("projectId") projectId: string,
     @Body() dto: CreateTaskDto,
+    @Headers("idempotency-key") idempotencyKey?: string,
   ) {
-    return this.tasksService.createTask(userId, systemRole, projectId, dto);
+    return this.tasksService.createTask(
+      userId,
+      systemRole,
+      projectId,
+      dto,
+      idempotencyKey,
+    );
   }
 
   @Patch("tasks/:taskId")

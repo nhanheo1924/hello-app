@@ -9,7 +9,12 @@ export class UsersService {
   create(
     data: Pick<
       Prisma.UserCreateInput,
-      'email' | 'passwordHash' | 'fullName' | 'displayName' | 'firstName' | 'lastName'
+      | 'email'
+      | 'passwordHash'
+      | 'fullName'
+      | 'displayName'
+      | 'firstName'
+      | 'lastName'
     >,
   ): Promise<User> {
     return this.prisma.user.create({ data });

@@ -114,6 +114,10 @@ export class ProjectsController {
     @Param("projectId") projectId: string,
     @Param("memberUserId") memberUserId: string,
   ) {
-    return this.tasksService.removeProjectMember(userId, projectId, memberUserId);
+    return this.tasksService.removeProjectMember(
+      userId,
+      projectId,
+      memberUserId,
+    );
   }
 }

@@ -53,6 +53,7 @@ import { UpdateProjectSettingsDto } from "./dto/update-project-settings.dto";
 import { UpdateMemberRoleDto } from "./dto/update-member-role.dto";
 import { UpdateTaskDto } from "./dto/update-task.dto";
 import { UpdateWorkspaceDto } from "./dto/update-workspace.dto";
+import { UpdateWorkspaceSettingsDto } from "./dto/update-workspace-settings.dto";
 
 type PrismaTx = Prisma.TransactionClient;
 
@@ -78,6 +79,15 @@ type DirectoryUser = {
   avatarUrl: string | null;
 };
 
+type WorkspaceSettingsPayload = {
+  startDate: string | null;
+  endDate: string | null;
+  hourFormat: "12" | "24";
+  showWeekends: boolean;
+  weekStart: "mon" | "sun";
+  defaultDurationHours: number;
+};
+
 const VIEW_ROLES: WorkspaceRole[] = [
   WorkspaceRole.OWNER,
   WorkspaceRole.ADMIN,
@@ -90,14 +100,35 @@ const EDIT_ROLES: WorkspaceRole[] = [
   WorkspaceRole.MEMBER,
 ];
 const ADMIN_ROLES: WorkspaceRole[] = [WorkspaceRole.OWNER, WorkspaceRole.ADMIN];
+const WORKSPACE_INVITER_ROLES: WorkspaceRole[] = [
+  WorkspaceRole.OWNER,
+  WorkspaceRole.ADMIN,
+  WorkspaceRole.MEMBER,
+];
+const MEMBER_INVITEABLE_WORKSPACE_ROLES: WorkspaceRole[] = [
+  WorkspaceRole.MEMBER,
+  WorkspaceRole.VIEWER,
+];
 const SYSTEM_ADMIN_ROLES = new Set(["SUPER_ADMIN", "SYSTEM_ADMIN"]);
+const WORKSPACE_SETTINGS_DEFAULTS: WorkspaceSettingsPayload = {
+  startDate: null,
+  endDate: null,
+  hourFormat: "24",
+  showWeekends: true,
+  weekStart: "mon",
+  defaultDurationHours: 2,
+};
+const TASK_CREATE_DUPLICATE_WINDOW_MS = 10_000;
 
 @Injectable()
 export class TasksService {
   private readonly authInternalBaseUrl: string;
   private readonly internalProxySecret: string;
   private readonly notificationStreams = new Map<string, Set<Response>>();
-  private readonly notificationHeartbeatTimers = new Map<Response, NodeJS.Timeout>();
+  private readonly notificationHeartbeatTimers = new Map<
+    Response,
+    NodeJS.Timeout
+  >();
   private lastDueNotificationSweepAt = 0;
   private readonly dueNotificationSweepWindowMs = 2 * 60 * 1000;
 
@@ -129,6 +160,7 @@ export class TasksService {
       include: {
         workspace: {
           include: {
+            settings: true,
             _count: {
               select: {
                 members: true,
@@ -146,18 +178,206 @@ export class TasksService {
     });
 
     return {
-      data: memberships.map((membership) => ({
-        id: membership.workspace.id,
-        name: membership.workspace.name,
-        ownerUserId: membership.workspace.ownerUserId,
-        role: membership.role,
-        memberCount: membership.workspace._count.members,
-        projectCount: membership.workspace._count.projects,
-        createdAt: membership.workspace.createdAt,
-        updatedAt: membership.workspace.updatedAt,
+      data: memberships.map((membership) =>
+        this.toWorkspaceSummary(membership.workspace, membership.role),
+      ),
+      meta: this.toPaginationMeta(total, pagination.page, pagination.limit),
+    };
+  }
+
+  async listAdminWorkspaces(
+    systemRole: string | undefined,
+    page?: number,
+    limit?: number,
+  ) {
+    this.assertSystemAdminRole(systemRole);
+    const pagination = this.resolvePagination(page, limit);
+
+    const [total, workspaces] = await Promise.all([
+      this.prisma.workspace.count(),
+      this.prisma.workspace.findMany({
+        include: {
+          settings: true,
+          _count: {
+            select: {
+              members: true,
+              projects: true,
+            },
+          },
+        },
+        orderBy: {
+          createdAt: "desc",
+        },
+        skip: pagination.skip,
+        take: pagination.limit,
+      }),
+    ]);
+
+    const workspaceIds = workspaces.map((workspace) => workspace.id);
+    const projectCounts =
+      workspaceIds.length === 0
+        ? []
+        : await this.prisma.project.findMany({
+            where: {
+              workspaceId: { in: workspaceIds },
+            },
+            select: {
+              workspaceId: true,
+              _count: {
+                select: {
+                  tasks: true,
+                },
+              },
+            },
+          });
+
+    const taskCountByWorkspaceId = new Map<string, number>();
+    projectCounts.forEach((project) => {
+      const current = taskCountByWorkspaceId.get(project.workspaceId) ?? 0;
+      taskCountByWorkspaceId.set(
+        project.workspaceId,
+        current + project._count.tasks,
+      );
+    });
+
+    return {
+      data: workspaces.map((workspace) => ({
+        id: workspace.id,
+        name: workspace.name,
+        ownerUserId: workspace.ownerUserId,
+        status: workspace.status,
+        taskCount: taskCountByWorkspaceId.get(workspace.id) ?? 0,
+        memberCount: workspace._count?.members ?? 0,
+        projectCount: workspace._count?.projects ?? 0,
+        createdAt: workspace.createdAt,
+        updatedAt: workspace.updatedAt,
+        settings: this.serializeWorkspaceSettings(workspace.settings ?? null),
       })),
       meta: this.toPaginationMeta(total, pagination.page, pagination.limit),
     };
+  }
+
+  async getInternalUserWorkspaceOwnership(userId: string): Promise<{
+    data: {
+      ownerWorkspaceCount: number;
+    };
+  }> {
+    const ownerWorkspaceCount = await this.prisma.workspace.count({
+      where: { ownerUserId: userId },
+    });
+    return {
+      data: {
+        ownerWorkspaceCount,
+      },
+    };
+  }
+
+  async cleanupUserWorkspaceData(userId: string): Promise<{
+    data: {
+      ownerWorkspaceCount: number;
+      removedWorkspaceMemberships: number;
+      removedProjectMemberships: number;
+      clearedTaskAssignees: number;
+      clearedTaskCompletedBy: number;
+      removedNotificationRecipients: number;
+      removedNotificationActors: number;
+    };
+  }> {
+    const result = await this.prisma.$transaction(async (tx) => {
+      const ownerWorkspaceCount = await tx.workspace.count({
+        where: { ownerUserId: userId },
+      });
+      if (ownerWorkspaceCount > 0) {
+        throw new ConflictException({
+          code: "USER_OWNS_WORKSPACES",
+          message:
+            "Cannot delete this user while they still own one or more workspaces",
+          details: {
+            ownerWorkspaceCount,
+          },
+        });
+      }
+
+      const [
+        workspaceMemberships,
+        projectMemberships,
+        taskAssignees,
+        taskCompletedBy,
+        notificationRecipients,
+        notificationActors,
+      ] = await Promise.all([
+        tx.workspaceMember.deleteMany({
+          where: {
+            userId,
+            role: {
+              not: WorkspaceRole.OWNER,
+            },
+          },
+        }),
+        tx.projectMember.deleteMany({
+          where: {
+            userId,
+            role: {
+              not: WorkspaceRole.OWNER,
+            },
+          },
+        }),
+        tx.task.updateMany({
+          where: {
+            assigneeUserId: userId,
+          },
+          data: {
+            assigneeUserId: null,
+          },
+        }),
+        tx.task.updateMany({
+          where: {
+            completedByUserId: userId,
+          },
+          data: {
+            completedByUserId: null,
+          },
+        }),
+        tx.notification.deleteMany({
+          where: {
+            recipientUserId: userId,
+          },
+        }),
+        tx.notification.deleteMany({
+          where: {
+            actorUserId: userId,
+          },
+        }),
+      ]);
+
+      return {
+        ownerWorkspaceCount,
+        removedWorkspaceMemberships: workspaceMemberships.count,
+        removedProjectMemberships: projectMemberships.count,
+        clearedTaskAssignees: taskAssignees.count,
+        clearedTaskCompletedBy: taskCompletedBy.count,
+        removedNotificationRecipients: notificationRecipients.count,
+        removedNotificationActors: notificationActors.count,
+      };
+    });
+
+    return { data: result };
+  }
+
+  async adminGetUserWorkspaceOwnership(
+    systemRole: string | undefined,
+    targetUserId: string,
+  ) {
+    this.assertSystemAdminRole(systemRole);
+    return this.getInternalUserWorkspaceOwnership(targetUserId);
+  }
+
+  async adminCleanupUserWorkspaceData(
+    systemRole: string | undefined,
+    targetUserId: string,
+  ) {
+    this.assertSystemAdminRole(systemRole);
+    return this.cleanupUserWorkspaceData(targetUserId);
   }
 
   async createWorkspace(userId: string, dto: CreateWorkspaceDto) {
@@ -167,6 +387,16 @@ export class TasksService {
         data: {
           name,
           ownerUserId: userId,
+        },
+      });
+      await tx.workspaceSetting.create({
+        data: {
+          workspaceId: createdWorkspace.id,
+          hourFormat: WORKSPACE_SETTINGS_DEFAULTS.hourFormat,
+          showWeekends: WORKSPACE_SETTINGS_DEFAULTS.showWeekends,
+          weekStart: WORKSPACE_SETTINGS_DEFAULTS.weekStart,
+          defaultDurationHours:
+            WORKSPACE_SETTINGS_DEFAULTS.defaultDurationHours,
         },
       });
       await tx.workspaceMember.create({
@@ -226,7 +456,7 @@ export class TasksService {
     });
 
     return {
-      data: workspace,
+      data: (await this.getWorkspace(userId, workspace.id)).data,
     };
   }
 
@@ -239,6 +469,7 @@ export class TasksService {
     const workspace = await this.prisma.workspace.findUnique({
       where: { id: workspaceId },
       include: {
+        settings: true,
         _count: {
           select: {
             members: true,
@@ -256,16 +487,7 @@ export class TasksService {
     }
 
     return {
-      data: {
-        id: workspace.id,
-        name: workspace.name,
-        ownerUserId: workspace.ownerUserId,
-        role: context.role,
-        memberCount: workspace._count.members,
-        projectCount: workspace._count.projects,
-        createdAt: workspace.createdAt,
-        updatedAt: workspace.updatedAt,
-      },
+      data: this.toWorkspaceSummary(workspace, context.role),
     };
   }
 
@@ -309,8 +531,224 @@ export class TasksService {
     });
 
     return {
-      data: updated,
+      data: (await this.getWorkspace(userId, updated.id)).data,
     };
+  }
+
+  async getWorkspaceSettings(userId: string, workspaceId: string) {
+    await this.requireWorkspaceRole(userId, workspaceId, VIEW_ROLES);
+    const settings = await this.ensureWorkspaceSettings(workspaceId);
+
+    return {
+      data: this.serializeWorkspaceSettings(settings),
+    };
+  }
+
+  async updateWorkspaceSettings(
+    userId: string,
+    workspaceId: string,
+    dto: UpdateWorkspaceSettingsDto,
+  ) {
+    await this.requireWorkspaceRole(userId, workspaceId, ADMIN_ROLES);
+
+    const currentSettings = await this.ensureWorkspaceSettings(workspaceId);
+    const nextStartDate =
+      dto.startDate !== undefined
+        ? this.parseWorkspaceSettingDate(dto.startDate)
+        : currentSettings.startDate;
+    const nextEndDate =
+      dto.endDate !== undefined
+        ? this.parseWorkspaceSettingDate(dto.endDate)
+        : currentSettings.endDate;
+    this.assertValidWorkspaceDateRange(nextStartDate, nextEndDate);
+
+    if (
+      dto.defaultDurationHours !== undefined &&
+      !this.isHalfStepDuration(dto.defaultDurationHours)
+    ) {
+      throw new BadRequestException({
+        code: "VALIDATION_ERROR",
+        message: "Default duration must be in 0.5 hour steps",
+      });
+    }
+
+    const data: Prisma.WorkspaceSettingUncheckedUpdateInput = {};
+    if (dto.startDate !== undefined) {
+      data.startDate = nextStartDate;
+    }
+    if (dto.endDate !== undefined) {
+      data.endDate = nextEndDate;
+    }
+    if (dto.hourFormat !== undefined) {
+      data.hourFormat = dto.hourFormat;
+    }
+    if (dto.showWeekends !== undefined) {
+      data.showWeekends = dto.showWeekends;
+    }
+    if (dto.weekStart !== undefined) {
+      data.weekStart = dto.weekStart;
+    }
+    if (dto.defaultDurationHours !== undefined) {
+      data.defaultDurationHours = dto.defaultDurationHours;
+    }
+
+    const updated = await this.prisma.workspaceSetting.upsert({
+      where: { workspaceId },
+      create: {
+        workspaceId,
+        startDate: nextStartDate,
+        endDate: nextEndDate,
+        hourFormat: dto.hourFormat ?? currentSettings.hourFormat,
+        showWeekends: dto.showWeekends ?? currentSettings.showWeekends,
+        weekStart: dto.weekStart ?? currentSettings.weekStart,
+        defaultDurationHours:
+          dto.defaultDurationHours ?? currentSettings.defaultDurationHours,
+      },
+      update: data,
+    });
+
+    await this.recordActivity(this.prisma, {
+      workspaceId,
+      actorUserId: userId,
+      action: "WORKSPACE_SETTINGS_UPDATED",
+      entityType: "setting",
+      entityId: workspaceId,
+      payload: {
+        updatedFields: Object.keys(data),
+      },
+    });
+
+    return {
+      data: this.serializeWorkspaceSettings(updated),
+    };
+  }
+
+  private toWorkspaceSummary(
+    workspace: {
+      id: string;
+      name: string;
+      ownerUserId: string;
+      createdAt: Date;
+      updatedAt: Date;
+      settings?: {
+        startDate: Date | null;
+        endDate: Date | null;
+        hourFormat: string;
+        showWeekends: boolean;
+        weekStart: string;
+        defaultDurationHours: number;
+      } | null;
+      _count?: {
+        members: number;
+        projects: number;
+      };
+    },
+    role: WorkspaceRole | string,
+  ) {
+    return {
+      id: workspace.id,
+      name: workspace.name,
+      ownerUserId: workspace.ownerUserId,
+      role,
+      memberCount: workspace._count?.members ?? 0,
+      projectCount: workspace._count?.projects ?? 0,
+      createdAt: workspace.createdAt,
+      updatedAt: workspace.updatedAt,
+      settings: this.serializeWorkspaceSettings(workspace.settings ?? null),
+    };
+  }
+
+  private serializeWorkspaceSettings(
+    settings:
+      | {
+          startDate: Date | null;
+          endDate: Date | null;
+          hourFormat: string;
+          showWeekends: boolean;
+          weekStart: string;
+          defaultDurationHours: number;
+        }
+      | null
+      | undefined,
+  ): WorkspaceSettingsPayload {
+    if (!settings) {
+      return { ...WORKSPACE_SETTINGS_DEFAULTS };
+    }
+
+    return {
+      startDate: settings.startDate
+        ? settings.startDate.toISOString().slice(0, 10)
+        : null,
+      endDate: settings.endDate ? settings.endDate.toISOString().slice(0, 10) : null,
+      hourFormat: settings.hourFormat === "12" ? "12" : "24",
+      showWeekends: settings.showWeekends !== false,
+      weekStart: settings.weekStart === "sun" ? "sun" : "mon",
+      defaultDurationHours:
+        Number.isFinite(settings.defaultDurationHours) &&
+        settings.defaultDurationHours >= 0.5 &&
+        settings.defaultDurationHours <= 12
+          ? settings.defaultDurationHours
+          : WORKSPACE_SETTINGS_DEFAULTS.defaultDurationHours,
+    };
+  }
+
+  private async ensureWorkspaceSettings(workspaceId: string) {
+    return this.prisma.workspaceSetting.upsert({
+      where: { workspaceId },
+      create: {
+        workspaceId,
+        hourFormat: WORKSPACE_SETTINGS_DEFAULTS.hourFormat,
+        showWeekends: WORKSPACE_SETTINGS_DEFAULTS.showWeekends,
+        weekStart: WORKSPACE_SETTINGS_DEFAULTS.weekStart,
+        defaultDurationHours: WORKSPACE_SETTINGS_DEFAULTS.defaultDurationHours,
+      },
+      update: {},
+    });
+  }
+
+  private parseWorkspaceSettingDate(
+    value: string | null | undefined,
+  ): Date | null {
+    if (value === undefined || value === null || String(value).trim() === "") {
+      return null;
+    }
+
+    const normalized = String(value).trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
+      throw new BadRequestException({
+        code: "VALIDATION_ERROR",
+        message: "Workspace dates must use YYYY-MM-DD format",
+      });
+    }
+
+    const parsed = new Date(`${normalized}T00:00:00.000Z`);
+    if (
+      Number.isNaN(parsed.getTime()) ||
+      parsed.toISOString().slice(0, 10) !== normalized
+    ) {
+      throw new BadRequestException({
+        code: "VALIDATION_ERROR",
+        message: "Workspace dates must be valid calendar dates",
+      });
+    }
+
+    return parsed;
+  }
+
+  private assertValidWorkspaceDateRange(
+    startDate: Date | null,
+    endDate: Date | null,
+  ): void {
+    if (startDate && endDate && startDate.getTime() > endDate.getTime()) {
+      throw new BadRequestException({
+        code: "VALIDATION_ERROR",
+        message: "Workspace start date must be on or before end date",
+      });
+    }
+  }
+
+  private isHalfStepDuration(value: number): boolean {
+    return Math.abs(value * 2 - Math.round(value * 2)) < 1e-9;
   }
 
   async deleteWorkspace(userId: string, workspaceId: string) {
@@ -502,7 +940,11 @@ export class TasksService {
     projectId: string,
     dto: UpdateProjectDto,
   ) {
-    const { project } = await this.requireProjectAccess(userId, projectId, "admin");
+    const { project } = await this.requireProjectAccess(
+      userId,
+      projectId,
+      "admin",
+    );
 
     const data: Prisma.ProjectUpdateInput = {};
     if (dto.name !== undefined) {
@@ -571,7 +1013,11 @@ export class TasksService {
   }
 
   async deleteProject(userId: string, projectId: string) {
-    const { project } = await this.requireProjectAccess(userId, projectId, "admin");
+    const { project } = await this.requireProjectAccess(
+      userId,
+      projectId,
+      "admin",
+    );
 
     await this.prisma.$transaction(async (tx) => {
       await this.recordActivity(tx, {
@@ -596,7 +1042,11 @@ export class TasksService {
   }
 
   async getProjectSettings(userId: string, projectId: string) {
-    const { project } = await this.requireProjectAccess(userId, projectId, "view");
+    const { project } = await this.requireProjectAccess(
+      userId,
+      projectId,
+      "view",
+    );
     const settings = await this.prisma.projectSetting.upsert({
       where: { projectId },
       create: {
@@ -613,7 +1063,11 @@ export class TasksService {
     projectId: string,
     dto: UpdateProjectSettingsDto,
   ) {
-    const { project } = await this.requireProjectAccess(userId, projectId, "admin");
+    const { project } = await this.requireProjectAccess(
+      userId,
+      projectId,
+      "admin",
+    );
     const updated = await this.prisma.projectSetting.upsert({
       where: { projectId },
       create: {
@@ -629,11 +1083,15 @@ export class TasksService {
         isPrivateByDefault: dto.isPrivateByDefault ?? true,
       },
       update: {
-        ...(dto.defaultView !== undefined ? { defaultView: dto.defaultView } : {}),
+        ...(dto.defaultView !== undefined
+          ? { defaultView: dto.defaultView }
+          : {}),
         ...(dto.allowMemberInvite !== undefined
           ? { allowMemberInvite: dto.allowMemberInvite }
           : {}),
-        ...(dto.allowComment !== undefined ? { allowComment: dto.allowComment } : {}),
+        ...(dto.allowComment !== undefined
+          ? { allowComment: dto.allowComment }
+          : {}),
         ...(dto.allowViewerComment !== undefined
           ? { allowViewerComment: dto.allowViewerComment }
           : {}),
@@ -680,12 +1138,13 @@ export class TasksService {
     return { data: updated };
   }
 
-  async getCalendar(userId: string, projectId: string, query: CalendarQueryDto) {
-    const { project, workspaceRole, projectRole } = await this.requireProjectAccess(
-      userId,
-      projectId,
-      "view",
-    );
+  async getCalendar(
+    userId: string,
+    projectId: string,
+    query: CalendarQueryDto,
+  ) {
+    const { project, workspaceRole, projectRole } =
+      await this.requireProjectAccess(userId, projectId, "view");
 
     const where: Prisma.TaskWhereInput = {
       projectId,
@@ -772,6 +1231,7 @@ export class TasksService {
     systemRole: string | undefined,
     workspaceId: string,
     dto: CreateTaskDto,
+    idempotencyKey?: string,
   ) {
     const projectId = await this.resolveWorkspacePrimaryProjectId(
       userId,
@@ -779,7 +1239,13 @@ export class TasksService {
       "edit",
       systemRole,
     );
-    return this.createTask(userId, systemRole, projectId, dto);
+    return this.createTask(
+      userId,
+      systemRole,
+      projectId,
+      dto,
+      idempotencyKey,
+    );
   }
 
   async listWorkspaceMembers(userId: string, workspaceId: string) {
@@ -801,7 +1267,26 @@ export class TasksService {
     workspaceId: string,
     dto: AddMemberByEmailDto,
   ) {
-    await this.requireWorkspaceRole(userId, workspaceId, ADMIN_ROLES);
+    const workspaceContext = await this.requireWorkspaceRole(
+      userId,
+      workspaceId,
+      WORKSPACE_INVITER_ROLES,
+    );
+    if (dto.role === WorkspaceRole.OWNER) {
+      throw new BadRequestException({
+        code: "WORKSPACE_OWNER_IMMUTABLE",
+        message: "Workspace owner is immutable",
+      });
+    }
+    if (
+      workspaceContext.role === WorkspaceRole.MEMBER &&
+      !MEMBER_INVITEABLE_WORKSPACE_ROLES.includes(dto.role)
+    ) {
+      throw new ForbiddenException({
+        code: "WORKSPACE_FORBIDDEN",
+        message: "Members can only invite MEMBER or VIEWER roles",
+      });
+    }
     const user = await this.lookupUserByEmail(dto.email);
     if (!user) {
       throw new BadRequestException({
@@ -855,6 +1340,12 @@ export class TasksService {
     dto: UpdateMemberRoleDto,
   ) {
     await this.requireWorkspaceRole(userId, workspaceId, ADMIN_ROLES);
+    if (dto.role === WorkspaceRole.OWNER) {
+      throw new BadRequestException({
+        code: "WORKSPACE_OWNER_IMMUTABLE",
+        message: "Workspace owner is immutable",
+      });
+    }
     const member = await this.prisma.workspaceMember.findUnique({
       where: {
         workspaceId_userId: {
@@ -867,6 +1358,12 @@ export class TasksService {
       throw new NotFoundException({
         code: "WORKSPACE_MEMBER_NOT_FOUND",
         message: "Workspace member not found",
+      });
+    }
+    if (member.role === WorkspaceRole.OWNER) {
+      throw new BadRequestException({
+        code: "WORKSPACE_OWNER_IMMUTABLE",
+        message: "Workspace owner is immutable",
       });
     }
 
@@ -900,7 +1397,10 @@ export class TasksService {
 
     const usersById = await this.lookupUsersByIds([updated.userId]);
     return {
-      data: this.withDirectoryProfile(updated, usersById.get(updated.userId) ?? null),
+      data: this.withDirectoryProfile(
+        updated,
+        usersById.get(updated.userId) ?? null,
+      ),
     };
   }
 
@@ -1089,7 +1589,8 @@ export class TasksService {
     if (
       (dto.role === WorkspaceRole.OWNER &&
         memberUserId !== access.project.ownerUserId) ||
-      (memberUserId === access.project.ownerUserId && dto.role !== WorkspaceRole.OWNER)
+      (memberUserId === access.project.ownerUserId &&
+        dto.role !== WorkspaceRole.OWNER)
     ) {
       throw new BadRequestException({
         code: "PROJECT_OWNER_IMMUTABLE",
@@ -1134,11 +1635,18 @@ export class TasksService {
     }
     const usersById = await this.lookupUsersByIds([updated.userId]);
     return {
-      data: this.withDirectoryProfile(updated, usersById.get(updated.userId) ?? null),
+      data: this.withDirectoryProfile(
+        updated,
+        usersById.get(updated.userId) ?? null,
+      ),
     };
   }
 
-  async removeProjectMember(userId: string, projectId: string, memberUserId: string) {
+  async removeProjectMember(
+    userId: string,
+    projectId: string,
+    memberUserId: string,
+  ) {
     await this.requireProjectAccess(userId, projectId, "admin");
     const member = await this.prisma.projectMember.findUnique({
       where: {
@@ -1175,11 +1683,8 @@ export class TasksService {
   }
 
   async getBoard(userId: string, projectId: string, query: BoardQueryDto) {
-    const { project, workspaceRole, projectRole } = await this.requireProjectAccess(
-      userId,
-      projectId,
-      "view",
-    );
+    const { project, workspaceRole, projectRole } =
+      await this.requireProjectAccess(userId, projectId, "view");
     const taskWhere = this.buildBoardTaskWhere(project.id, query);
 
     const board = await this.prisma.project.findUniqueOrThrow({
@@ -1254,6 +1759,7 @@ export class TasksService {
     systemRole: string | undefined,
     projectId: string,
     dto: CreateTaskDto,
+    idempotencyKey?: string,
   ) {
     const access = await this.requireProjectAccess(
       userId,
@@ -1264,69 +1770,131 @@ export class TasksService {
     const { project } = access;
     this.assertMemberCreateOwnership(access, userId, dto.assigneeUserId);
     const assigneeUserId = dto.assigneeUserId ?? null;
+    const normalizedIdempotencyKey = this.normalizeIdempotencyKey(idempotencyKey);
+    const normalizedTitle = dto.title.trim();
+    const normalizedDescription = dto.description?.trim() || null;
+    const normalizedPriority = dto.priority ?? TaskPriority.MEDIUM;
+    const normalizedStatus = dto.status ?? TaskStatus.TODO;
+    const normalizedStartAt = dto.startAt ? new Date(dto.startAt) : null;
+    const normalizedDueAt = dto.dueAt ? new Date(dto.dueAt) : null;
+    const normalizedAllDay = dto.allDay ?? false;
+    const normalizedEstimatedMinutes = dto.estimatedMinutes ?? null;
 
-    const task = await this.prisma.$transaction(async (tx) => {
-      const targetColumnId = await this.resolveTargetColumnIdForCreate(
+    const mutationResult = await this.prisma.$transaction(async (tx) => {
+      return this.runIdempotentMutationWithReplayState(
         tx,
-        project.id,
-        dto.columnId,
-      );
-      const orderIndex = await this.nextOrderIndex(tx, targetColumnId);
-
-      const createdTask = await tx.task.create({
-        data: {
+        normalizedIdempotencyKey,
+        userId,
+        "TASK_CREATE",
+        {
           projectId: project.id,
-          columnId: targetColumnId,
-          title: dto.title.trim(),
-          description: dto.description?.trim() || null,
-          priority: dto.priority ?? TaskPriority.MEDIUM,
-          status: dto.status ?? TaskStatus.TODO,
-          startAt: dto.startAt ? new Date(dto.startAt) : null,
-          dueAt: dto.dueAt ? new Date(dto.dueAt) : null,
-          allDay: dto.allDay ?? false,
-          estimatedMinutes: dto.estimatedMinutes ?? null,
-          completedAt:
-            (dto.status ?? TaskStatus.TODO) === TaskStatus.DONE ? new Date() : null,
-          completedByUserId:
-            (dto.status ?? TaskStatus.TODO) === TaskStatus.DONE ? userId : null,
-          assigneeUserId,
-          orderIndex,
-          createdByUserId: userId,
+          dto: {
+            ...dto,
+            title: normalizedTitle,
+            description: normalizedDescription,
+            priority: normalizedPriority,
+            status: normalizedStatus,
+            startAt: normalizedStartAt?.toISOString() ?? null,
+            dueAt: normalizedDueAt?.toISOString() ?? null,
+            allDay: normalizedAllDay,
+            estimatedMinutes: normalizedEstimatedMinutes,
+            assigneeUserId,
+          },
         },
-      });
+        async () => {
+          const targetColumnId = await this.resolveTargetColumnIdForCreate(
+            tx,
+            project.id,
+            dto.columnId,
+          );
 
-      await this.recordActivity(tx, {
-        workspaceId: project.workspaceId,
-        projectId: project.id,
-        taskId: createdTask.id,
-        actorUserId: userId,
-        action: "TASK_CREATED",
-        entityType: "task",
-        entityId: createdTask.id,
-        payload: {
-          title: createdTask.title,
-          columnId: createdTask.columnId,
+          const duplicate = await this.findRecentDuplicateTaskCreate(tx, {
+            projectId: project.id,
+            createdByUserId: userId,
+            title: normalizedTitle,
+            description: normalizedDescription,
+            priority: normalizedPriority,
+            status: normalizedStatus,
+            startAt: normalizedStartAt,
+            dueAt: normalizedDueAt,
+            allDay: normalizedAllDay,
+            estimatedMinutes: normalizedEstimatedMinutes,
+            assigneeUserId,
+            columnId: targetColumnId,
+          });
+          if (duplicate) {
+            return {
+              task: duplicate,
+              created: false,
+            };
+          }
+
+          const orderIndex = await this.nextOrderIndex(tx, targetColumnId);
+          const createdTask = await tx.task.create({
+            data: {
+              projectId: project.id,
+              columnId: targetColumnId,
+              title: normalizedTitle,
+              description: normalizedDescription,
+              priority: normalizedPriority,
+              status: normalizedStatus,
+              startAt: normalizedStartAt,
+              dueAt: normalizedDueAt,
+              allDay: normalizedAllDay,
+              estimatedMinutes: normalizedEstimatedMinutes,
+              completedAt:
+                normalizedStatus === TaskStatus.DONE ? new Date() : null,
+              completedByUserId:
+                normalizedStatus === TaskStatus.DONE ? userId : null,
+              assigneeUserId,
+              orderIndex,
+              createdByUserId: userId,
+            },
+          });
+
+          await this.recordActivity(tx, {
+            workspaceId: project.workspaceId,
+            projectId: project.id,
+            taskId: createdTask.id,
+            actorUserId: userId,
+            action: "TASK_CREATED",
+            entityType: "task",
+            entityId: createdTask.id,
+            payload: {
+              title: createdTask.title,
+              columnId: createdTask.columnId,
+            },
+          });
+
+          return {
+            task: createdTask,
+            created: true,
+          };
         },
-      });
-
-      return createdTask;
+      );
     });
+    const mutation = mutationResult.value;
 
-    if (task.assigneeUserId && task.assigneeUserId !== userId) {
+    if (
+      mutation.created &&
+      !mutationResult.replayed &&
+      mutation.task.assigneeUserId &&
+      mutation.task.assigneeUserId !== userId
+    ) {
       await this.pushNotification({
-        recipientUserId: task.assigneeUserId,
+        recipientUserId: mutation.task.assigneeUserId,
         actorUserId: userId,
         workspaceId: project.workspaceId,
         projectId: project.id,
-        taskId: task.id,
+        taskId: mutation.task.id,
         type: NotificationType.TASK_ASSIGNED,
         title: "Task assigned",
-        body: `You were assigned to ${task.title}.`,
+        body: `You were assigned to ${mutation.task.title}.`,
       });
     }
 
     return {
-      data: task,
+      data: mutation.task,
     };
   }
 
@@ -1824,8 +2392,18 @@ export class TasksService {
         message: "Task not found",
       });
     }
-    const access = await this.requireProjectAccess(userId, task.projectId, "view");
+    const access = await this.requireProjectAccess(
+      userId,
+      task.projectId,
+      "view",
+    );
     if (!this.canProjectEdit(access.workspaceRole, access.projectRole)) {
+      if (access.workspaceRole === WorkspaceRole.VIEWER) {
+        throw new ForbiddenException({
+          code: "PROJECT_FORBIDDEN",
+          message: "Viewers cannot create comments",
+        });
+      }
       const settings = await this.ensureProjectSettings(
         access.project.id,
         access.project.defaultView,
@@ -2080,7 +2658,11 @@ export class TasksService {
     };
   }
 
-  openNotificationStream(userId: string, request: Request, response: Response): void {
+  openNotificationStream(
+    userId: string,
+    request: Request,
+    response: Response,
+  ): void {
     response.status(200);
     response.setHeader("content-type", "text/event-stream; charset=utf-8");
     response.setHeader("cache-control", "no-cache, no-transform");
@@ -2088,7 +2670,8 @@ export class TasksService {
     response.setHeader("x-accel-buffering", "no");
     response.flushHeaders?.();
 
-    const userStreams = this.notificationStreams.get(userId) ?? new Set<Response>();
+    const userStreams =
+      this.notificationStreams.get(userId) ?? new Set<Response>();
     userStreams.add(response);
     this.notificationStreams.set(userId, userStreams);
 
@@ -2114,7 +2697,12 @@ export class TasksService {
     workspaceId: string,
     query: ActivityQueryDto,
   ) {
-    await this.requireWorkspaceRole(userId, workspaceId, VIEW_ROLES, systemRole);
+    await this.requireWorkspaceRole(
+      userId,
+      workspaceId,
+      VIEW_ROLES,
+      systemRole,
+    );
     const pagination = this.resolvePagination(query.page, query.limit);
     const where = this.buildActivityWhere(
       {
@@ -2174,7 +2762,12 @@ export class TasksService {
     workspaceId: string,
     query: SearchQueryDto,
   ) {
-    await this.requireWorkspaceRole(userId, workspaceId, VIEW_ROLES, systemRole);
+    await this.requireWorkspaceRole(
+      userId,
+      workspaceId,
+      VIEW_ROLES,
+      systemRole,
+    );
     const q = query.q.trim();
     if (!q) {
       throw new BadRequestException({
@@ -2189,9 +2782,10 @@ export class TasksService {
         .map((item) => item.trim().toLowerCase())
         .filter((item) => item.length > 0),
     );
-    const limit = Number.isInteger(query.limit) && (query.limit ?? 0) > 0
-      ? Math.min(query.limit as number, 100)
-      : 25;
+    const limit =
+      Number.isInteger(query.limit) && (query.limit ?? 0) > 0
+        ? Math.min(query.limit as number, 100)
+        : 25;
 
     const [projects, tasks, members, labels] = await Promise.all([
       types.has("project")
@@ -2257,7 +2851,12 @@ export class TasksService {
     systemRole: string | undefined,
     workspaceId: string,
   ) {
-    await this.requireWorkspaceRole(userId, workspaceId, VIEW_ROLES, systemRole);
+    await this.requireWorkspaceRole(
+      userId,
+      workspaceId,
+      VIEW_ROLES,
+      systemRole,
+    );
     const views = await this.prisma.savedView.findMany({
       where: {
         workspaceId,
@@ -2274,7 +2873,12 @@ export class TasksService {
     workspaceId: string,
     dto: CreateSavedViewDto,
   ) {
-    await this.requireWorkspaceRole(userId, workspaceId, VIEW_ROLES, systemRole);
+    await this.requireWorkspaceRole(
+      userId,
+      workspaceId,
+      VIEW_ROLES,
+      systemRole,
+    );
     if (dto.isDefault) {
       await this.prisma.savedView.updateMany({
         where: {
@@ -2389,7 +2993,12 @@ export class TasksService {
     systemRole: string | undefined,
     workspaceId: string,
   ) {
-    await this.requireWorkspaceRole(userId, workspaceId, VIEW_ROLES, systemRole);
+    await this.requireWorkspaceRole(
+      userId,
+      workspaceId,
+      VIEW_ROLES,
+      systemRole,
+    );
     const templates = await this.prisma.projectTemplate.findMany({
       where: { workspaceId },
       include: {
@@ -2408,7 +3017,12 @@ export class TasksService {
     workspaceId: string,
     dto: CreateTemplateDto,
   ) {
-    await this.requireWorkspaceRole(userId, workspaceId, ADMIN_ROLES, systemRole);
+    await this.requireWorkspaceRole(
+      userId,
+      workspaceId,
+      ADMIN_ROLES,
+      systemRole,
+    );
     const template = await this.prisma.$transaction(async (tx) => {
       const created = await tx.projectTemplate.create({
         data: {
@@ -2516,7 +3130,10 @@ export class TasksService {
       if (dto.settings !== undefined) {
         await tx.projectTemplateSetting.upsert({
           where: { templateId },
-          create: this.resolveTemplateSettingCreateData(templateId, dto.settings),
+          create: this.resolveTemplateSettingCreateData(
+            templateId,
+            dto.settings,
+          ),
           update: this.resolveTemplateSettingUpdateData(dto.settings),
         });
       }
@@ -2567,7 +3184,12 @@ export class TasksService {
     templateId: string,
     dto: CreateProjectFromTemplateDto,
   ) {
-    await this.requireWorkspaceRole(userId, workspaceId, EDIT_ROLES, systemRole);
+    await this.requireWorkspaceRole(
+      userId,
+      workspaceId,
+      EDIT_ROLES,
+      systemRole,
+    );
     const template = await this.prisma.projectTemplate.findFirst({
       where: {
         id: templateId,
@@ -2699,45 +3321,51 @@ export class TasksService {
     workspaceId: string,
     query: ReportOverviewQueryDto,
   ) {
-    await this.requireWorkspaceRole(userId, workspaceId, ADMIN_ROLES, systemRole);
+    await this.requireWorkspaceRole(
+      userId,
+      workspaceId,
+      ADMIN_ROLES,
+      systemRole,
+    );
     const range = this.resolveReportRange(query.from, query.to);
-    const [createdCount, completedCount, overdueCount, totalTaskCount] = await Promise.all([
-      this.prisma.task.count({
-        where: {
-          project: { workspaceId },
-          createdAt: {
-            gte: range.from,
-            lte: range.to,
+    const [createdCount, completedCount, overdueCount, totalTaskCount] =
+      await Promise.all([
+        this.prisma.task.count({
+          where: {
+            project: { workspaceId },
+            createdAt: {
+              gte: range.from,
+              lte: range.to,
+            },
           },
-        },
-      }),
-      this.prisma.task.count({
-        where: {
-          project: { workspaceId },
-          completedAt: {
-            gte: range.from,
-            lte: range.to,
+        }),
+        this.prisma.task.count({
+          where: {
+            project: { workspaceId },
+            completedAt: {
+              gte: range.from,
+              lte: range.to,
+            },
           },
-        },
-      }),
-      this.prisma.task.count({
-        where: {
-          project: { workspaceId },
-          archivedAt: null,
-          dueAt: {
-            lt: new Date(),
+        }),
+        this.prisma.task.count({
+          where: {
+            project: { workspaceId },
+            archivedAt: null,
+            dueAt: {
+              lt: new Date(),
+            },
+            status: {
+              not: TaskStatus.DONE,
+            },
           },
-          status: {
-            not: TaskStatus.DONE,
+        }),
+        this.prisma.task.count({
+          where: {
+            project: { workspaceId },
           },
-        },
-      }),
-      this.prisma.task.count({
-        where: {
-          project: { workspaceId },
-        },
-      }),
-    ]);
+        }),
+      ]);
 
     const groupBy = query.groupBy ?? ReportGroupBy.DAY;
     const unit = groupBy === ReportGroupBy.WEEK ? "week" : "day";
@@ -2784,7 +3412,12 @@ export class TasksService {
     workspaceId: string,
     query: ReportBreakdownQueryDto,
   ) {
-    await this.requireWorkspaceRole(userId, workspaceId, ADMIN_ROLES, systemRole);
+    await this.requireWorkspaceRole(
+      userId,
+      workspaceId,
+      ADMIN_ROLES,
+      systemRole,
+    );
     const range = this.resolveReportRange(query.from, query.to);
 
     if (query.dimension === ReportBreakdownDimension.PROJECT) {
@@ -2871,7 +3504,12 @@ export class TasksService {
     workspaceId: string,
     query: ReportExportQueryDto,
   ): Promise<{ filename: string; csv: string }> {
-    await this.requireWorkspaceRole(userId, workspaceId, ADMIN_ROLES, systemRole);
+    await this.requireWorkspaceRole(
+      userId,
+      workspaceId,
+      ADMIN_ROLES,
+      systemRole,
+    );
     const range = this.resolveReportRange(query.from, query.to);
     const type = query.type ?? ReportExportType.SUMMARY;
     const safeType = String(type).toLowerCase();
@@ -2899,7 +3537,17 @@ export class TasksService {
         take: 5000,
       });
       const csv = this.toCsv(
-        ["taskId", "projectName", "title", "status", "priority", "assigneeUserId", "createdAt", "completedAt", "dueAt"],
+        [
+          "taskId",
+          "projectName",
+          "title",
+          "status",
+          "priority",
+          "assigneeUserId",
+          "createdAt",
+          "completedAt",
+          "dueAt",
+        ],
         rows.map((row) => [
           row.id,
           row.project.name,
@@ -2928,7 +3576,16 @@ export class TasksService {
         take: 10000,
       });
       const csv = this.toCsv(
-        ["activityId", "actorUserId", "action", "entityType", "entityId", "projectId", "taskId", "createdAt"],
+        [
+          "activityId",
+          "actorUserId",
+          "action",
+          "entityType",
+          "entityId",
+          "projectId",
+          "taskId",
+          "createdAt",
+        ],
         rows.map((row) => [
           row.id,
           row.actorUserId,
@@ -2943,11 +3600,16 @@ export class TasksService {
       return { filename, csv };
     }
 
-    const overview = await this.getReportOverview(userId, systemRole, workspaceId, {
-      from: range.from.toISOString(),
-      to: range.to.toISOString(),
-      groupBy: ReportGroupBy.DAY,
-    });
+    const overview = await this.getReportOverview(
+      userId,
+      systemRole,
+      workspaceId,
+      {
+        from: range.from.toISOString(),
+        to: range.to.toISOString(),
+        groupBy: ReportGroupBy.DAY,
+      },
+    );
     const metrics = overview.data.metrics;
     const csv = this.toCsv(
       ["metric", "value"],
@@ -3116,9 +3778,7 @@ export class TasksService {
       workspaceRole: WorkspaceRole;
       projectRole: WorkspaceRole | null;
     },
-    policy:
-      | "allowTaskReorder"
-      | "allowTaskDeleteByMember",
+    policy: "allowTaskReorder" | "allowTaskDeleteByMember",
     message: string,
   ): Promise<void> {
     if (!this.isMemberLevelEditor(access.workspaceRole, access.projectRole)) {
@@ -3261,7 +3921,11 @@ export class TasksService {
       },
     });
 
-    this.emitNotificationEvent(input.recipientUserId, "notification.created", created);
+    this.emitNotificationEvent(
+      input.recipientUserId,
+      "notification.created",
+      created,
+    );
     await this.emitUnreadCount(input.recipientUserId);
   }
 
@@ -3314,7 +3978,11 @@ export class TasksService {
     });
   }
 
-  private writeSseEvent(response: Response, event: string, payload: unknown): void {
+  private writeSseEvent(
+    response: Response,
+    event: string,
+    payload: unknown,
+  ): void {
     response.write(`event: ${event}\n`);
     response.write(`data: ${JSON.stringify(payload)}\n\n`);
   }
@@ -3361,7 +4029,10 @@ export class TasksService {
 
   private async dispatchDueNotificationsIfNeeded(): Promise<void> {
     const nowMs = Date.now();
-    if (nowMs - this.lastDueNotificationSweepAt < this.dueNotificationSweepWindowMs) {
+    if (
+      nowMs - this.lastDueNotificationSweepAt <
+      this.dueNotificationSweepWindowMs
+    ) {
       return;
     }
     this.lastDueNotificationSweepAt = nowMs;
@@ -3508,15 +4179,19 @@ export class TasksService {
     const source = settings ?? {};
     const defaultView =
       typeof source.defaultView === "string" &&
-      Object.values(ProjectViewType).includes(source.defaultView as ProjectViewType)
+      Object.values(ProjectViewType).includes(
+        source.defaultView as ProjectViewType,
+      )
         ? (source.defaultView as ProjectViewType)
         : ProjectViewType.BOARD;
     const taskPrefix =
-      typeof source.taskPrefix === "string" && source.taskPrefix.trim().length > 0
+      typeof source.taskPrefix === "string" &&
+      source.taskPrefix.trim().length > 0
         ? source.taskPrefix.trim().slice(0, 20)
         : null;
     const themeColor =
-      typeof source.themeColor === "string" && source.themeColor.trim().length > 0
+      typeof source.themeColor === "string" &&
+      source.themeColor.trim().length > 0
         ? source.themeColor.trim().slice(0, 32)
         : null;
 
@@ -3635,10 +4310,10 @@ export class TasksService {
       const asString = String(value);
       if (
         asString.includes(",") ||
-        asString.includes("\"") ||
+        asString.includes('"') ||
         asString.includes("\n")
       ) {
-        return `"${asString.replace(/"/g, "\"\"")}"`;
+        return `"${asString.replace(/"/g, '""')}"`;
       }
       return asString;
     };
@@ -3657,7 +4332,11 @@ export class TasksService {
     systemRole?: string,
   ): Promise<string> {
     const allowedRoles =
-      access === "view" ? VIEW_ROLES : access === "edit" ? EDIT_ROLES : ADMIN_ROLES;
+      access === "view"
+        ? VIEW_ROLES
+        : access === "edit"
+          ? EDIT_ROLES
+          : ADMIN_ROLES;
     const workspaceContext = await this.requireWorkspaceRole(
       userId,
       workspaceId,
@@ -3837,8 +4516,12 @@ export class TasksService {
     };
   }
 
-  private async lookupUserByEmail(emailInput: string): Promise<DirectoryUser | null> {
-    const email = String(emailInput || "").trim().toLowerCase();
+  private async lookupUserByEmail(
+    emailInput: string,
+  ): Promise<DirectoryUser | null> {
+    const email = String(emailInput || "")
+      .trim()
+      .toLowerCase();
     if (!email) {
       throw new BadRequestException({
         code: "VALIDATION_ERROR",
@@ -3871,7 +4554,9 @@ export class TasksService {
           message: "Cannot verify user email",
         });
       }
-      const body = (await response.json()) as { user?: Record<string, unknown> };
+      const body = (await response.json()) as {
+        user?: Record<string, unknown>;
+      };
       const normalized = this.toDirectoryUser(body.user);
       if (!normalized) {
         return null;
@@ -3888,10 +4573,14 @@ export class TasksService {
     }
   }
 
-  private async lookupUsersByIds(userIds: string[]): Promise<Map<string, DirectoryUser>> {
+  private async lookupUsersByIds(
+    userIds: string[],
+  ): Promise<Map<string, DirectoryUser>> {
     const uniqueIds = Array.from(
       new Set(
-        (Array.isArray(userIds) ? userIds : []).filter((id) => typeof id === "string" && id.length > 0),
+        (Array.isArray(userIds) ? userIds : []).filter(
+          (id) => typeof id === "string" && id.length > 0,
+        ),
       ),
     );
     if (uniqueIds.length === 0) {
@@ -3939,7 +4628,8 @@ export class TasksService {
     }
     const record = input as Record<string, unknown>;
     const id = typeof record.id === "string" ? record.id.trim() : "";
-    const emailRaw = typeof record.email === "string" ? record.email.trim().toLowerCase() : "";
+    const emailRaw =
+      typeof record.email === "string" ? record.email.trim().toLowerCase() : "";
     if (!id || !emailRaw) {
       return null;
     }
@@ -3948,7 +4638,8 @@ export class TasksService {
       id,
       email: emailRaw,
       displayName:
-        typeof record.displayName === "string" && record.displayName.trim().length > 0
+        typeof record.displayName === "string" &&
+        record.displayName.trim().length > 0
           ? record.displayName.trim()
           : null,
       fullName:
@@ -3956,7 +4647,8 @@ export class TasksService {
           ? record.fullName.trim()
           : null,
       firstName:
-        typeof record.firstName === "string" && record.firstName.trim().length > 0
+        typeof record.firstName === "string" &&
+        record.firstName.trim().length > 0
           ? record.firstName.trim()
           : null,
       lastName:
@@ -3964,7 +4656,8 @@ export class TasksService {
           ? record.lastName.trim()
           : null,
       avatarUrl:
-        typeof record.avatarUrl === "string" && record.avatarUrl.trim().length > 0
+        typeof record.avatarUrl === "string" &&
+        record.avatarUrl.trim().length > 0
           ? record.avatarUrl.trim()
           : null,
     };
@@ -4015,7 +4708,9 @@ export class TasksService {
       }
     >
   > {
-    const usersById = await this.lookupUsersByIds(members.map((member) => member.userId));
+    const usersById = await this.lookupUsersByIds(
+      members.map((member) => member.userId),
+    );
     return members.map((member) =>
       this.withDirectoryProfile(member, usersById.get(member.userId) ?? null),
     );
@@ -4092,6 +4787,47 @@ export class TasksService {
     });
   }
 
+  private async findRecentDuplicateTaskCreate(
+    tx: PrismaTx,
+    input: {
+      projectId: string;
+      createdByUserId: string;
+      title: string;
+      description: string | null;
+      priority: TaskPriority;
+      status: TaskStatus;
+      startAt: Date | null;
+      dueAt: Date | null;
+      allDay: boolean;
+      estimatedMinutes: number | null;
+      assigneeUserId: string | null;
+      columnId: string | null;
+    },
+  ): Promise<Task | null> {
+    return tx.task.findFirst({
+      where: {
+        projectId: input.projectId,
+        createdByUserId: input.createdByUserId,
+        title: input.title,
+        description: input.description,
+        priority: input.priority,
+        status: input.status,
+        startAt: input.startAt,
+        dueAt: input.dueAt,
+        allDay: input.allDay,
+        estimatedMinutes: input.estimatedMinutes,
+        assigneeUserId: input.assigneeUserId,
+        columnId: input.columnId,
+        createdAt: {
+          gte: new Date(Date.now() - TASK_CREATE_DUPLICATE_WINDOW_MS),
+        },
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
+    });
+  }
+
   private async runIdempotentMutation<T>(
     tx: PrismaTx,
     key: string | undefined,
@@ -4100,8 +4836,30 @@ export class TasksService {
     requestPayload: unknown,
     execute: () => Promise<T>,
   ): Promise<T> {
+    const result = await this.runIdempotentMutationWithReplayState(
+      tx,
+      key,
+      userId,
+      action,
+      requestPayload,
+      execute,
+    );
+    return result.value;
+  }
+
+  private async runIdempotentMutationWithReplayState<T>(
+    tx: PrismaTx,
+    key: string | undefined,
+    userId: string,
+    action: string,
+    requestPayload: unknown,
+    execute: () => Promise<T>,
+  ): Promise<{ value: T; replayed: boolean }> {
     if (!key) {
-      return execute();
+      return {
+        value: await execute(),
+        replayed: false,
+      };
     }
     const requestHash = this.hashRequestPayload(requestPayload);
     const existing = await tx.idempotencyRecord.findUnique({
@@ -4122,7 +4880,10 @@ export class TasksService {
         });
       }
 
-      return existing.response as T;
+      return {
+        value: existing.response as T,
+        replayed: true,
+      };
     }
 
     const result = await execute();
@@ -4136,7 +4897,10 @@ export class TasksService {
       },
     });
 
-    return result;
+    return {
+      value: result,
+      replayed: false,
+    };
   }
 
   private normalizeIdempotencyKey(
@@ -4164,6 +4928,18 @@ export class TasksService {
 
   private toJsonValue(value: unknown): Prisma.InputJsonValue {
     return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
+  }
+
+  private assertSystemAdminRole(systemRole: string | undefined): void {
+    const normalized = String(systemRole || "")
+      .trim()
+      .toUpperCase();
+    if (!SYSTEM_ADMIN_ROLES.has(normalized)) {
+      throw new ForbiddenException({
+        code: "AUTH_FORBIDDEN",
+        message: "System admin permission required",
+      });
+    }
   }
 
   private resolvePagination(
@@ -4204,4 +4980,3 @@ export class TasksService {
     return Math.min(Math.max(value, min), max);
   }
 }
-

@@ -1,7 +1,7 @@
 param(
   [string]$BffApiBase = 'http://localhost:3001/api/v1',
   [string]$AuthHealthUrl = 'http://localhost:3000/api/health/ready',
-  [string]$TaskHealthUrl = 'http://localhost:3102/api/health/ready',
+  [string]$TaskHealthUrl = 'http://localhost:3002/api/health/ready',
   [string]$CloudflareZaClientId = '',
   [string]$CloudflareZaClientSecret = ''
 )
@@ -20,7 +20,8 @@ function Invoke-JsonApi {
     [string]$Method,
     [string]$Url,
     [hashtable]$Headers = @{},
-    [object]$Body = $null
+    [object]$Body = $null,
+    [Microsoft.PowerShell.Commands.WebRequestSession]$WebSession = $null
   )
 
   $mergedHeaders = @{}
@@ -36,6 +37,9 @@ function Invoke-JsonApi {
     Uri = $Url
     Headers = $mergedHeaders
     ErrorAction = 'Stop'
+  }
+  if ($null -ne $WebSession) {
+    $requestParams['WebSession'] = $WebSession
   }
 
   if ($null -ne $Body) {
@@ -60,44 +64,38 @@ $password = 'CtmLocal2026!'
 $fullName = 'Local Stack Verify'
 
 Write-Host '2) Registering and logging in test user via BFF...'
+$session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
 $null = Invoke-JsonApi -Method 'POST' -Url "$BffApiBase/auth/signup" -Body @{
   email = $email
   password = $password
   fullName = $fullName
-}
+} -WebSession $session
 
 $login = Invoke-JsonApi -Method 'POST' -Url "$BffApiBase/auth/login" -Body @{
   email = $email
   password = $password
-}
-
-$token = [string]$login.accessToken
-if ([string]::IsNullOrWhiteSpace($token)) {
-  throw 'Login succeeded but accessToken is missing.'
-}
-
-$authHeaders = @{ Authorization = "Bearer $token" }
+} -WebSession $session
 
 Write-Host '3) Creating workspace/project/task via BFF...'
-$workspace = Invoke-JsonApi -Method 'POST' -Url "$BffApiBase/workspaces" -Headers $authHeaders -Body @{ name = "Local Workspace $emailSuffix" }
+$workspace = Invoke-JsonApi -Method 'POST' -Url "$BffApiBase/workspaces" -Body @{ name = "Local Workspace $emailSuffix" } -WebSession $session
 $workspaceId = [string]$workspace.data.id
 if ([string]::IsNullOrWhiteSpace($workspaceId)) {
   throw 'Workspace creation failed: missing workspace id.'
 }
 
-$project = Invoke-JsonApi -Method 'POST' -Url "$BffApiBase/workspaces/$workspaceId/projects" -Headers $authHeaders -Body @{ name = "Local Project $emailSuffix"; description = 'Created by verify-local-stack.ps1' }
+$project = Invoke-JsonApi -Method 'POST' -Url "$BffApiBase/workspaces/$workspaceId/projects" -Body @{ name = "Local Project $emailSuffix"; description = 'Created by verify-local-stack.ps1' } -WebSession $session
 $projectId = [string]$project.data.id
 if ([string]::IsNullOrWhiteSpace($projectId)) {
   throw 'Project creation failed: missing project id.'
 }
 
-$task = Invoke-JsonApi -Method 'POST' -Url "$BffApiBase/projects/$projectId/tasks" -Headers $authHeaders -Body @{ title = "Verify Task $emailSuffix"; description = 'Persisted in Postgres'; priority = 'MEDIUM'; status = 'TODO' }
+$task = Invoke-JsonApi -Method 'POST' -Url "$BffApiBase/projects/$projectId/tasks" -Body @{ title = "Verify Task $emailSuffix"; description = 'Persisted in Postgres'; priority = 'MEDIUM'; status = 'TODO' } -WebSession $session
 $taskId = [string]$task.data.id
 if ([string]::IsNullOrWhiteSpace($taskId)) {
   throw 'Task creation failed: missing task id.'
 }
 
-$board = Invoke-JsonApi -Method 'GET' -Url "$BffApiBase/projects/$projectId/board" -Headers $authHeaders
+$board = Invoke-JsonApi -Method 'GET' -Url "$BffApiBase/projects/$projectId/board" -WebSession $session
 $allTasks = @()
 if ($board.data -and $board.data.columns) {
   foreach ($column in $board.data.columns) {

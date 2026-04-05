@@ -17,8 +17,15 @@
     "build": "npm --prefix apps/auth-service run build && npm --prefix apps/task-service run build && npm --prefix apps/bff-service run build && npm --prefix apps/web run build",
     "verify:stack": "powershell -ExecutionPolicy Bypass -File ./scripts/verify-local-stack.ps1",
     "verify:auth": "powershell -ExecutionPolicy Bypass -File ./scripts/verify-auth-flows.ps1",
+    "verify:admin:gate": "powershell -ExecutionPolicy Bypass -File ./scripts/verify-admin-hotfix-gate.ps1",
     "seed:admin:test": "powershell -ExecutionPolicy Bypass -File ./scripts/seed-admin-test.ps1",
     "verify:local": "powershell -ExecutionPolicy Bypass -File ./scripts/run-local-verify.ps1",
-    "verify:local:tunnel": "powershell -ExecutionPolicy Bypass -File ./scripts/run-local-verify.ps1 -UseCloudflaredTunnel"
+    "verify:local:tunnel": "powershell -ExecutionPolicy Bypass -File ./scripts/run-local-verify.ps1 -UseCloudflaredTunnel",
+    "docker:down": "docker compose down --remove-orphans",
+    "docker:build": "docker compose build --no-cache auth-service task-service bff-service",
+    "docker:up": "docker compose up -d",
+    "docker:migrate:auth": "docker compose exec auth-service npm run prisma:migrate:deploy",
+    "docker:migrate:task": "docker compose exec task-service npm run prisma:migrate:deploy",
+    "docker:rebuild": "npm run docker:down && npm run docker:build && npm run docker:up"
   }
 }

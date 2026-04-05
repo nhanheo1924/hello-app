@@ -1,5 +1,11 @@
 ﻿import { ProjectViewType, ProjectVisibility } from "@prisma/client";
-import { IsEnum, IsNotEmpty, IsOptional, IsString, MaxLength } from "class-validator";
+import {
+  IsEnum,
+  IsNotEmpty,
+  IsOptional,
+  IsString,
+  MaxLength,
+} from "class-validator";
 
 export class CreateProjectDto {
   @IsString()

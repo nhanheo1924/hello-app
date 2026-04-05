@@ -17,5 +17,118 @@ services:
       timeout: 5s
       retries: 10
 
+  redis:
+    image: redis:7-alpine
+    container_name: ctm-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - ctm_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  auth-service:
+    build:
+      context: ./apps/auth-service
+      dockerfile: Dockerfile
+    container_name: ctm-auth-service
+    restart: unless-stopped
+    env_file:
+      - ./docker/env/auth-service.env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-ctm-auth-service}?schema=public
+      INTERNAL_PROXY_SECRET: ${INTERNAL_PROXY_SECRET:-dev-internal-proxy-secret-0123456789ab}
+      TOTP_ENCRYPTION_SECRET: ${TOTP_ENCRYPTION_SECRET_LOCAL:-}
+      JWT_ACTIVE_KID: ${JWT_ACTIVE_KID:-ctm-dev-kid-1}
+      JWT_ACCESS_PRIVATE_KEY: ${JWT_ACCESS_PRIVATE_KEY:-}
+      JWT_ACCESS_PUBLIC_KEY: ${JWT_ACCESS_PUBLIC_KEY:-}
+      WEB_APP_URL: ${WEB_APP_URL_LOCAL:-http://localhost:5173}
+      WEB_APP_OAUTH_CALLBACK_URL: ${WEB_APP_OAUTH_CALLBACK_URL_LOCAL:-http://localhost:5173/auth/callback/}
+      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:-}
+      GOOGLE_OAUTH_REDIRECT_URI: ${GOOGLE_OAUTH_REDIRECT_URI_LOCAL:-http://localhost:3001/api/v1/auth/google/callback}
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"fetch('http://127.0.0.1:3000/api/health/ready').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\"",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  task-service:
+    build:
+      context: ./apps/task-service
+      dockerfile: Dockerfile
+    container_name: ctm-task-service
+    restart: unless-stopped
+    env_file:
+      - ./docker/env/task-service.env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-ctm-auth-service}?schema=task
+      AUTH_SERVICE_BASE_URL: http://auth-service:3000/api/auth
+      AUTH_SERVICE_INTERNAL_BASE_URL: http://auth-service:3000/api/internal
+      AUTH_JWKS_URL: http://auth-service:3000/.well-known/jwks.json
+      INTERNAL_PROXY_SECRET: ${INTERNAL_PROXY_SECRET:-dev-internal-proxy-secret-0123456789ab}
+    ports:
+      - "3002:3002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      auth-service:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"fetch('http://127.0.0.1:3002/api/health/ready').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\"",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  bff-service:
+    build:
+      context: ./apps/bff-service
+      dockerfile: Dockerfile
+    container_name: ctm-bff-service
+    restart: unless-stopped
+    env_file:
+      - ./docker/env/bff-service.env
+    environment:
+      AUTH_SERVICE_BASE_URL: http://auth-service:3000/api/auth
+      TASK_SERVICE_BASE_URL: http://task-service:3002/api
+      INTERNAL_PROXY_SECRET: ${INTERNAL_PROXY_SECRET:-dev-internal-proxy-secret-0123456789ab}
+    ports:
+      - "3001:3001"
+    depends_on:
+      auth-service:
+        condition: service_healthy
+      task-service:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"fetch('http://127.0.0.1:3001/api/v1/health/ready').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\"",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
 volumes:
   ctm_postgres_data:
+  ctm_redis_data:

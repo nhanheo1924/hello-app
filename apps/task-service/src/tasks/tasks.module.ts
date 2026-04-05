@@ -1,6 +1,7 @@
 import { Module } from "@nestjs/common";
 import { AuthModule } from "../auth/auth.module";
 import { GovernanceController } from "./governance.controller";
+import { InternalAdminController } from "./internal-admin.controller";
 import { NotificationsController } from "./notifications.controller";
 import { ProjectsController } from "./projects.controller";
 import { TasksController } from "./tasks.controller";
@@ -15,6 +16,7 @@ import { WorkspacesController } from "./workspaces.controller";
     TasksController,
     NotificationsController,
     GovernanceController,
+    InternalAdminController,
   ],
   providers: [TasksService],
 })

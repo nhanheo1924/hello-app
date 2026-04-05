@@ -1,3 +1,13 @@
+import {
+  canAssignWorkspaceInviteRole,
+  canEditWorkspaceMemberRoles,
+  canInviteWorkspaceMembers,
+  canRemoveWorkspaceMembers,
+  getWorkspaceInviteRoleOptions,
+  type PermissionContext,
+  type WorkspaceRole as PermissionWorkspaceRole,
+} from '../permissions/role-permissions';
+
 const STYLE_ID = 'orbit-header-hub-style';
 const ACTIVE_WORKSPACE_STORAGE_KEY = 'orbitActiveWorkspaceIdV1';
 const HOT_ROUTE_NAV_STORAGE_KEY = 'orbitHotRouteNavV1';
@@ -274,6 +284,36 @@ function getErrorCode(error: unknown): string {
   return code;
 }
 
+function getAuthPermissionContext(
+  members: WorkspaceMemberRow[],
+): PermissionContext {
+  const authUser =
+    window.OrbitAuth && typeof window.OrbitAuth.getStoredUser === 'function'
+      ? window.OrbitAuth.getStoredUser()
+      : null;
+  const currentUserId =
+    authUser && typeof authUser.id === 'string' ? authUser.id : '';
+  const currentMember =
+    currentUserId && Array.isArray(members)
+      ? members.find((member) => member && member.userId === currentUserId)
+      : null;
+  return {
+    systemRole:
+      authUser && typeof authUser.systemRole === 'string' ? authUser.systemRole : 'USER',
+    workspaceRole:
+      currentMember && typeof currentMember.role === 'string' ? currentMember.role : null,
+    projectRole: null,
+  };
+}
+
+function normalizeWorkspaceInviteRole(value: unknown): PermissionWorkspaceRole {
+  const role = String(value || '').trim().toUpperCase();
+  if (role === 'OWNER' || role === 'ADMIN' || role === 'MEMBER' || role === 'VIEWER') {
+    return role;
+  }
+  return 'MEMBER';
+}
+
 function resolveWorkspaceSettingsPath(workspaceId: string): string {
   const basePath =
     window.OrbitAuth && typeof window.OrbitAuth.resolvePath === 'function'
@@ -395,6 +435,70 @@ export function mountHeaderHub(): void {
   const listNode = panel.querySelector<HTMLElement>('[data-el="list"]');
   const emailInput = panel.querySelector<HTMLInputElement>('[data-el="email"]');
   const roleSelect = panel.querySelector<HTMLSelectElement>('[data-el="role"]');
+  const inviteButton = panel.querySelector<HTMLButtonElement>('[data-act="invite"]');
+  const permissionState: {
+    context: PermissionContext;
+    canInvite: boolean;
+    canEditRoles: boolean;
+    canRemoveMembers: boolean;
+    inviteRoleOptions: PermissionWorkspaceRole[];
+  } = {
+    context: { systemRole: 'USER', workspaceRole: null, projectRole: null },
+    canInvite: false,
+    canEditRoles: false,
+    canRemoveMembers: false,
+    inviteRoleOptions: [],
+  };
+
+  function syncInviteRoleOptions(): void {
+    if (!roleSelect) {
+      return;
+    }
+    const allowedRoles = permissionState.inviteRoleOptions.filter((role) => role !== 'OWNER');
+    const current = normalizeWorkspaceInviteRole(roleSelect.value);
+    roleSelect.innerHTML = '';
+    if (allowedRoles.length === 0) {
+      const option = document.createElement('option');
+      option.value = '';
+      option.textContent = 'No roles available';
+      option.selected = true;
+      option.disabled = true;
+      roleSelect.appendChild(option);
+      return;
+    }
+    allowedRoles.forEach((role) => {
+      const option = document.createElement('option');
+      option.value = role;
+      option.textContent = role;
+      roleSelect.appendChild(option);
+    });
+    roleSelect.value = allowedRoles.includes(current) ? current : allowedRoles[0];
+  }
+
+  function syncInviteControls(isLoading: boolean): void {
+    const cannotInvite =
+      isLoading || !permissionState.canInvite || permissionState.inviteRoleOptions.length === 0;
+    if (emailInput) {
+      emailInput.disabled = cannotInvite;
+    }
+    if (roleSelect) {
+      roleSelect.disabled = cannotInvite;
+    }
+    if (inviteButton) {
+      inviteButton.disabled = cannotInvite;
+    }
+  }
+
+  function applyWorkspaceMemberPermissions(rows: WorkspaceMemberRow[]): void {
+    const context = getAuthPermissionContext(rows);
+    permissionState.context = context;
+    permissionState.canInvite = canInviteWorkspaceMembers(context);
+    permissionState.canEditRoles = canEditWorkspaceMemberRoles(context);
+    permissionState.canRemoveMembers = canRemoveWorkspaceMembers(context);
+    permissionState.inviteRoleOptions = getWorkspaceInviteRoleOptions(context);
+    syncInviteRoleOptions();
+    syncInviteControls(false);
+  }
 
   function replaceWorkspaceOptions(
     selector: HTMLSelectElement,
@@ -464,9 +568,11 @@ export function mountHeaderHub(): void {
     }
 
     setStatus(statusNode, 'Loading members...');
+    syncInviteControls(true);
     try {
       const members = await window.OrbitTaskApi.listWorkspaceMembers(workspaceId);
       const rows = Array.isArray(members) ? members : [];
+      applyWorkspaceMemberPermissions(rows);
       if (rows.length === 0) {
         listNode.innerHTML = '<div class="orbit-share-empty">No members yet</div>';
         setStatus(statusNode, '');
@@ -476,7 +582,9 @@ export function mountHeaderHub(): void {
       listNode.innerHTML = rows
         .map((member: WorkspaceMemberRow) => {
           const memberUserId = typeof member.userId === 'string' ? member.userId : '';
-          const role = typeof member.role === 'string' ? member.role : 'MEMBER';
+          const role = normalizeWorkspaceInviteRole(
+            typeof member.role === 'string' ? member.role : 'MEMBER',
+          );
           const isOwner = role === 'OWNER';
           const displayName = escapeHtml(getDisplayName(member));
           const displayEmail = escapeHtml(getEmail(member));
@@ -491,13 +599,22 @@ export function mountHeaderHub(): void {
               </div>
             `;
           }
-          const roleOptions = isOwner
-            ? '<option value="OWNER">OWNER</option>'
-            : `
-              <option value="ADMIN" ${role === 'ADMIN' ? 'selected' : ''}>ADMIN</option>
-              <option value="MEMBER" ${role === 'MEMBER' ? 'selected' : ''}>MEMBER</option>
-              <option value="VIEWER" ${role === 'VIEWER' ? 'selected' : ''}>VIEWER</option>
+          if (!permissionState.canEditRoles) {
+            return `
+              <div class="orbit-share-row" data-user-id="${escapeHtml(memberUserId)}">
+                <div class="orbit-share-user">
+                  <div class="orbit-share-name">${displayName}</div>
+                  <div class="orbit-share-email">${displayEmail}</div>
+                </div>
+                <div class="orbit-share-owner-chip">${escapeHtml(role)}</div>
+              </div>
             `;
+          }
+          const roleOptions = `
+            <option value="ADMIN" ${role === 'ADMIN' ? 'selected' : ''}>ADMIN</option>
+            <option value="MEMBER" ${role === 'MEMBER' ? 'selected' : ''}>MEMBER</option>
+            <option value="VIEWER" ${role === 'VIEWER' ? 'selected' : ''}>VIEWER</option>
+          `;
           return `
             <div class="orbit-share-row" data-user-id="${escapeHtml(memberUserId)}">
               <div class="orbit-share-user">
@@ -506,13 +623,22 @@ export function mountHeaderHub(): void {
               </div>
               <select ${isOwner ? 'disabled' : ''}>${roleOptions}</select>
               <button type="button" data-act="save-role" ${isOwner ? 'disabled' : ''}>Save</button>
-              <button type="button" data-act="remove" title="Remove member" aria-label="Remove member" ${isOwner ? 'disabled' : ''}>\u2A02</button>
+              <button type="button" data-act="remove" title="Remove member" aria-label="Remove member" ${
+                isOwner || !permissionState.canRemoveMembers ? 'disabled' : ''
+              }>\u2A02</button>
             </div>
           `;
         })
         .join('');
       setStatus(statusNode, '');
     } catch (error) {
+      permissionState.context = { systemRole: 'USER', workspaceRole: null, projectRole: null };
+      permissionState.canInvite = false;
+      permissionState.canEditRoles = false;
+      permissionState.canRemoveMembers = false;
+      permissionState.inviteRoleOptions = [];
+      syncInviteRoleOptions();
+      syncInviteControls(false);
       setStatus(
         statusNode,
         `Cannot load members: ${String((error as { message?: string }).message || 'Unknown error')}`,
@@ -523,6 +649,10 @@ export function mountHeaderHub(): void {
 
   async function addMember(): Promise<void> {
     if (!window.OrbitTaskApi || !emailInput || !roleSelect) {
+      return;
+    }
+    if (!permissionState.canInvite) {
+      setStatus(statusNode, 'You do not have permission to invite members');
       return;
     }
     const workspaceId = currentWorkspaceId();
@@ -536,7 +666,11 @@ export function mountHeaderHub(): void {
       setStatus(statusNode, 'Please enter a valid email');
       return;
     }
-    const role = String(roleSelect.value || 'MEMBER').toUpperCase();
+    const role = normalizeWorkspaceInviteRole(roleSelect.value);
+    if (!canAssignWorkspaceInviteRole(permissionState.context, role)) {
+      setStatus(statusNode, 'Selected role is not allowed for your workspace permission');
+      return;
+    }
 
     try {
       await window.OrbitTaskApi.addWorkspaceMemberByEmail(workspaceId, { email, role });
@@ -634,8 +768,12 @@ export function mountHeaderHub(): void {
     }
 
     if (action === 'save-role') {
+      if (!permissionState.canEditRoles) {
+        setStatus(statusNode, 'You do not have permission to update member roles');
+        return;
+      }
       const select = row.querySelector<HTMLSelectElement>('select');
-      const role = String(select?.value || 'MEMBER').toUpperCase();
+      const role = normalizeWorkspaceInviteRole(select?.value || 'MEMBER');
       const nameNode = row.querySelector<HTMLElement>('.orbit-share-name');
       const memberName = String(nameNode?.textContent || 'member').trim() || 'member';
       void confirmHubAction(
@@ -665,6 +803,10 @@ export function mountHeaderHub(): void {
     }
 
     if (action === 'remove') {
+      if (!permissionState.canRemoveMembers) {
+        setStatus(statusNode, 'You do not have permission to remove members');
+        return;
+      }
       const nameNode = row.querySelector<HTMLElement>('.orbit-share-name');
       const memberName = String(nameNode?.textContent || 'member').trim() || 'member';
       void confirmHubAction(

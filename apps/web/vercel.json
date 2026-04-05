@@ -4,6 +4,14 @@
   "cleanUrls": false,
   "rewrites": [
     {
+      "source": "/api/v1",
+      "destination": "https://api.nhanctm.site/api/v1"
+    },
+    {
+      "source": "/api/v1/(.*)",
+      "destination": "https://api.nhanctm.site/api/v1/$1"
+    },
+    {
       "source": "/landing",
       "destination": "/landing/"
     },

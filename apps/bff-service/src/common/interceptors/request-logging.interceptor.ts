@@ -4,9 +4,9 @@ import {
   Injectable,
   Logger,
   NestInterceptor,
-} from '@nestjs/common';
-import { Request, Response } from 'express';
-import { Observable, tap } from 'rxjs';
+} from "@nestjs/common";
+import { Request, Response } from "express";
+import { Observable, tap } from "rxjs";
 
 type RequestWithId = Request & {
   requestId?: string;
@@ -14,7 +14,7 @@ type RequestWithId = Request & {
 
 @Injectable()
 export class RequestLoggingInterceptor implements NestInterceptor {
-  private readonly logger = new Logger('HTTP');
+  private readonly logger = new Logger("HTTP");
 
   intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
     const request = context.switchToHttp().getRequest<RequestWithId>();
@@ -24,7 +24,7 @@ export class RequestLoggingInterceptor implements NestInterceptor {
     return next.handle().pipe(
       tap(() => {
         const duration = Date.now() - startedAt;
-        const requestId = request.requestId ?? 'n/a';
+        const requestId = request.requestId ?? "n/a";
         this.logger.log(
           `${request.method} ${request.originalUrl} ${response.statusCode} ${duration}ms request_id=${requestId}`,
         );

@@ -1,5 +1,14 @@
 ﻿import { SystemRole, UserStatus } from '@prisma/client';
-import { IsEnum, IsInt, IsOptional, IsString, IsUUID, Max, MaxLength, Min } from 'class-validator';
+import {
+  IsEnum,
+  IsInt,
+  IsOptional,
+  IsString,
+  IsUUID,
+  Max,
+  MaxLength,
+  Min,
+} from 'class-validator';
 
 export class AdminUsersQueryDto {
   @IsOptional()
@@ -59,4 +68,3 @@ export class AdminAuditLogsQueryDto {
   @IsOptional()
   to?: string;
 }
-

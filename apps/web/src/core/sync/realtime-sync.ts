@@ -8,10 +8,30 @@ type InvalidatePayload = {
   ts?: number;
 };
 
+type AuthFailurePayload = {
+  source: 'sync-stream';
+  status: number;
+  code: string;
+  ts: number;
+};
+
+const SESSION_INVALID_CODES = new Set([
+  'AUTH_UNAUTHORIZED',
+  'SESSION_REVOKED',
+  'REFRESH_TOKEN_MISSING',
+  'REFRESH_INVALID',
+  'REFRESH_EXPIRED',
+  'REFRESH_REUSED',
+  'TOKEN_INVALID',
+  'TOKEN_EXPIRED',
+]);
+
 type ConnectOptions = {
   workspaceId?: string;
   onInvalidate?: (payload: InvalidatePayload) => void;
+  onTaskDelta?: (payload: Record<string, unknown>) => void;
   onStatusChange?: (status: RealtimeSyncStatus) => void;
+  onAuthFailure?: (payload: AuthFailurePayload) => void;
 };
 
 type LeaderLock = {
@@ -57,7 +77,12 @@ export function createRealtimeSyncCompat() {
     monitorTimer: null as number | null,
     channel: null as BroadcastChannel | null,
     onInvalidate: null as ConnectOptions['onInvalidate'] | null,
+    onTaskDelta: null as ConnectOptions['onTaskDelta'] | null,
     onStatusChange: null as ConnectOptions['onStatusChange'] | null,
+    onAuthFailure: null as ConnectOptions['onAuthFailure'] | null,
+    consecutiveStreamErrors: 0,
+    authProbeInFlight: false,
+    authFailureNotified: false,
   };
 
   function setStatus(status: RealtimeSyncStatus, broadcast = true): void {
@@ -80,6 +105,10 @@ export function createRealtimeSyncCompat() {
 
       if (data.type === 'invalidate' && data.payload) {
         handleInvalidate(data.payload as InvalidatePayload, false);
+        return;
+      }
+      if (data.type === 'task-delta' && data.payload && typeof data.payload === 'object') {
+        handleTaskDelta(data.payload as Record<string, unknown>, false);
         return;
       }
 
@@ -188,6 +217,30 @@ export function createRealtimeSyncCompat() {
     }
   }
 
+  function handleTaskDelta(
+    payload: Record<string, unknown>,
+    broadcast: boolean,
+  ): void {
+    const eventWorkspaceId =
+      typeof payload.workspaceId === 'string' ? payload.workspaceId.trim() : '';
+    if (
+      state.workspaceId &&
+      eventWorkspaceId &&
+      eventWorkspaceId !== '*' &&
+      eventWorkspaceId !== state.workspaceId
+    ) {
+      return;
+    }
+
+    if (typeof state.onTaskDelta === 'function') {
+      state.onTaskDelta(payload);
+    }
+
+    if (broadcast) {
+      postChannelMessage({ type: 'task-delta', payload });
+    }
+  }
+
   function openStream(): void {
     if (!state.running || !state.isLeader || !state.workspaceId) {
       return;
@@ -212,6 +265,8 @@ export function createRealtimeSyncCompat() {
 
     source.onopen = () => {
       state.reconnectAttempt = 0;
+      state.consecutiveStreamErrors = 0;
+      state.authFailureNotified = false;
       setStatus('connected');
     };
 
@@ -221,6 +276,10 @@ export function createRealtimeSyncCompat() {
         setStatus('offline');
         return;
       }
+      state.consecutiveStreamErrors += 1;
+      if (state.consecutiveStreamErrors >= 2) {
+        void probeAuthSession();
+      }
       setStatus('reconnecting');
       scheduleReconnect();
     };
@@ -229,6 +288,17 @@ export function createRealtimeSyncCompat() {
       try {
         const parsed = JSON.parse(String((event as MessageEvent).data || '{}'));
         handleInvalidate(parsed as InvalidatePayload, true);
+      } catch {
+        // ignore malformed event payloads
+      }
+    });
+
+    source.addEventListener('workspace.task.delta', (event) => {
+      try {
+        const parsed = JSON.parse(String((event as MessageEvent).data || '{}'));
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          handleTaskDelta(parsed as Record<string, unknown>, true);
+        }
       } catch {
         // ignore malformed event payloads
       }
@@ -311,6 +381,60 @@ export function createRealtimeSyncCompat() {
     }
   }
 
+  async function readResponseCode(response: Response): Promise<string> {
+    const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+    if (!contentType.includes('application/json')) {
+      return '';
+    }
+
+    try {
+      const payload = await response.json().catch(() => ({}));
+      if (!payload || typeof payload !== 'object') {
+        return '';
+      }
+      const code = (payload as { code?: unknown }).code;
+      return typeof code === 'string' ? code.trim().toUpperCase() : '';
+    } catch {
+      return '';
+    }
+  }
+
+  async function probeAuthSession(): Promise<void> {
+    if (state.authProbeInFlight || state.authFailureNotified) {
+      return;
+    }
+
+    state.authProbeInFlight = true;
+    try {
+      const response = await fetch(`${API_BASE_URL}/auth/me`, {
+        method: 'GET',
+        credentials: 'include',
+      });
+      const responseCode = await readResponseCode(response);
+      const shouldNotify =
+        response.status === 401
+          ? !responseCode || SESSION_INVALID_CODES.has(responseCode)
+          : response.status === 403
+            ? SESSION_INVALID_CODES.has(responseCode)
+            : false;
+      if (shouldNotify) {
+        state.authFailureNotified = true;
+        if (typeof state.onAuthFailure === 'function') {
+          state.onAuthFailure({
+            source: 'sync-stream',
+            status: response.status,
+            code: responseCode || 'AUTH_UNAUTHORIZED',
+            ts: Date.now(),
+          });
+        }
+      }
+    } catch {
+      // ignore probe failures and keep reconnect cycle active
+    } finally {
+      state.authProbeInFlight = false;
+    }
+  }
+
   function startTimers(): void {
     if (state.heartbeatTimer === null) {
       state.heartbeatTimer = window.setInterval(() => {
@@ -334,7 +458,11 @@ export function createRealtimeSyncCompat() {
     state.running = true;
     state.workspaceId = normalizeWorkspaceId(options.workspaceId);
     state.onInvalidate = options.onInvalidate || null;
+    state.onTaskDelta = options.onTaskDelta || null;
     state.onStatusChange = options.onStatusChange || null;
+    state.onAuthFailure = options.onAuthFailure || null;
+    state.consecutiveStreamErrors = 0;
+    state.authFailureNotified = false;
 
     ensureChannel();
     startTimers();
@@ -347,6 +475,9 @@ export function createRealtimeSyncCompat() {
     releaseLeaderLock();
     becomeFollower();
     clearTimers();
+    state.consecutiveStreamErrors = 0;
+    state.authFailureNotified = false;
+    state.onTaskDelta = null;
     document.removeEventListener('visibilitychange', handleVisibilityChange);
 
     if (state.channel) {
@@ -370,6 +501,8 @@ export function createRealtimeSyncCompat() {
     releaseLeaderLock();
     state.workspaceId = normalized;
     state.reconnectAttempt = 0;
+    state.consecutiveStreamErrors = 0;
+    state.authFailureNotified = false;
     refreshLeadership();
   }
 

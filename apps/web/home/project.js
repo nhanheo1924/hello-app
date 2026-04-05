@@ -1,6 +1,13 @@
 /**
  * Orbit Task Board
  */
+import {
+    formatDisplayDate,
+    formatDisplayDateRange,
+    formatDisplayDateTimeRange,
+    formatDueLabel,
+} from '../src/modules/tasks/date-display.js';
+
 let draggingTask = null;
 let resizingTask = null;
 let currentTaskData = null;
@@ -40,6 +47,23 @@ const CONNECTION_PROBE_VISIBLE_MS = 10 * 1000;
 const CONNECTION_PROBE_HIDDEN_MS = 60 * 1000;
 const REMOTE_REVALIDATE_MAX_AGE_MS = 10 * 1000;
 const REMOTE_WORKSPACE_LOAD_CONCURRENCY = 3;
+const REALTIME_INVALIDATE_DEBOUNCE_MS = 500;
+const REALTIME_TASK_INVALIDATE_FALLBACK_MS = 700;
+const REALTIME_TASK_INVALIDATE_RECENT_DELTA_MS = 1500;
+const TASK_AUTH_FAILURE_EVENT = 'orbit:task-auth-failure';
+const TASK_AUTH_SUCCESS_EVENT = 'orbit:task-auth-success';
+const AUTH_FAILURE_WINDOW_MS = 30 * 1000;
+const AUTH_FAILURE_THRESHOLD = 2;
+const SESSION_ERROR_CODES = new Set([
+    'AUTH_UNAUTHORIZED',
+    'SESSION_REVOKED',
+    'REFRESH_TOKEN_MISSING',
+    'REFRESH_INVALID',
+    'REFRESH_EXPIRED',
+    'REFRESH_REUSED',
+    'TOKEN_INVALID',
+    'TOKEN_EXPIRED'
+]);
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const PROJECT_META_PREFIX = '__ORBIT_PROJECT_META_V1__:';
 const TASK_META_PREFIX = '__ORBIT_TASK_META_V1__:';
@@ -126,6 +150,18 @@ const state = {
         timer: null,
         inFlight: false
     },
+    realtimeInvalidate: {
+        timer: null,
+        pending: false,
+        inFlight: false,
+        taskFallbackTimer: null,
+        lastTaskDeltaAt: 0
+    },
+    authFailures: {
+        count: 0,
+        lastAt: 0,
+        locked: false
+    },
     filters: {
         text: '',
         status: 'All',
@@ -166,6 +202,81 @@ function readErrorCodeFromError(error) {
         if (bodyCode) return bodyCode;
     }
     return '';
+}
+
+function readErrorStatusFromError(error) {
+    if (!error || typeof error !== 'object') return 0;
+    const status = Number(error.status || 0);
+    return Number.isFinite(status) ? status : 0;
+}
+
+function isSessionAuthFailure(input) {
+    const code = normalizeErrorCode(
+        (input && typeof input === 'object' ? input.code : '') || readErrorCodeFromError(input)
+    );
+    return SESSION_ERROR_CODES.has(code);
+}
+
+function resetAuthFailureState() {
+    state.authFailures.count = 0;
+    state.authFailures.lastAt = 0;
+}
+
+function forceSessionReauth() {
+    if (state.authFailures.locked) return;
+    state.authFailures.locked = true;
+
+    clearConnectionProbeTimer();
+    if (realtimeSync && typeof realtimeSync.disconnect === 'function') {
+        realtimeSync.disconnect();
+    }
+
+    showErrorToast('Session expired. Please sign in again.', 'Authentication Required', {
+        code: 'SESSION_EXPIRED'
+    });
+
+    setTimeout(() => {
+        if (window.OrbitAuth && typeof window.OrbitAuth.signOut === 'function') {
+            window.OrbitAuth.signOut({ redirectTo: '/signin/' });
+            return;
+        }
+        window.location.href = routePath('/signin/');
+    }, 220);
+}
+
+function registerSessionAuthFailure(detail = {}) {
+    if (state.authFailures.locked) return;
+
+    const now = Date.now();
+    if (now - state.authFailures.lastAt > AUTH_FAILURE_WINDOW_MS) {
+        state.authFailures.count = 0;
+    }
+
+    state.authFailures.count += 1;
+    state.authFailures.lastAt = now;
+
+    if (state.authFailures.count >= AUTH_FAILURE_THRESHOLD) {
+        forceSessionReauth();
+    }
+}
+
+function handleTaskAuthFailureEvent(event) {
+    const detail = event && typeof event === 'object' && event.detail && typeof event.detail === 'object'
+        ? event.detail
+        : {};
+    if (!isSessionAuthFailure(detail)) return;
+    registerSessionAuthFailure(detail);
+}
+
+function handleTaskAuthSuccessEvent() {
+    if (state.authFailures.locked) return;
+    resetAuthFailureState();
+}
+
+function attachTaskAuthWatchers() {
+    if (typeof window.addEventListener !== 'function') return;
+    window.addEventListener(TASK_AUTH_FAILURE_EVENT, handleTaskAuthFailureEvent);
+    window.addEventListener(TASK_AUTH_SUCCESS_EVENT, handleTaskAuthSuccessEvent);
 }
 
 function getTaskDebugContext(activeProject, extras = {}) {
@@ -1042,6 +1153,7 @@ function sanitizeTask(task, index) {
 
 function sanitizeProject(project, index) {
     const raw = project && typeof project === 'object' ? project : {};
+    const rawSettings = raw.settings && typeof raw.settings === 'object' ? raw.settings : {};
     const membersRaw = Array.isArray(raw.members) ? raw.members : [];
     const tasksRaw = Array.isArray(raw.tasks) ? raw.tasks : [];
     const workspaceId = isUuid(raw.workspaceId) ? raw.workspaceId : '';
@@ -1065,12 +1177,26 @@ function sanitizeProject(project, index) {
         ownerUserId: isUuid(raw.ownerUserId) ? raw.ownerUserId : '',
         visibility: String(raw.visibility || 'PRIVATE').toUpperCase() === 'WORKSPACE' ? 'WORKSPACE' : 'PRIVATE',
         defaultView: String(raw.defaultView || 'BOARD').toUpperCase() === 'CALENDAR' ? 'CALENDAR' : 'BOARD',
-        startDate: normalizeWorkspaceDate(raw.startDate),
-        endDate: normalizeWorkspaceDate(raw.endDate),
-        hourFormat: normalizeWorkspaceHourFormat(raw.hourFormat, '24'),
-        showWeekends: normalizeWorkspaceShowWeekends(raw.showWeekends, true),
-        weekStart: normalizeWorkspaceWeekStart(raw.weekStart, 'mon'),
-        defaultDurationHours: normalizeWorkspaceDefaultDuration(raw.defaultDurationHours, 2),
+        startDate: normalizeWorkspaceDate(rawSettings.startDate || raw.startDate),
+        endDate: normalizeWorkspaceDate(rawSettings.endDate || raw.endDate),
+        hourFormat: normalizeWorkspaceHourFormat(
+            rawSettings.hourFormat !== undefined ? rawSettings.hourFormat : raw.hourFormat,
+            '24'
+        ),
+        showWeekends: normalizeWorkspaceShowWeekends(
+            rawSettings.showWeekends !== undefined ? rawSettings.showWeekends : raw.showWeekends,
+            true
+        ),
+        weekStart: normalizeWorkspaceWeekStart(
+            rawSettings.weekStart !== undefined ? rawSettings.weekStart : raw.weekStart,
+            'mon'
+        ),
+        defaultDurationHours: normalizeWorkspaceDefaultDuration(
+            rawSettings.defaultDurationHours !== undefined
+                ? rawSettings.defaultDurationHours
+                : raw.defaultDurationHours,
+            2
+        ),
         workspaceRole: typeof raw.workspaceRole === 'string' ? raw.workspaceRole.toUpperCase() : '',
         projectRole: typeof raw.projectRole === 'string' ? raw.projectRole.toUpperCase() : '',
         members: membersRaw.map(sanitizeMember),
@@ -1454,6 +1580,18 @@ function buildRemoteTaskPayload(task, columns) {
     return payload;
 }
 
+function buildTaskCreateIdempotencyKey(task, workspaceId) {
+    const workspacePart = isUuid(workspaceId) ? workspaceId : '';
+    const localTaskId = sanitizeText(task && task.id, 64);
+    const titlePart = sanitizeText(task && task.name, 40) || 'untitled';
+    const startDatePart = isISODate(task && task.startDate) ? task.startDate : '';
+    const startTimePart = isTimeValue(task && task.startTime) ? task.startTime : '';
+    const assigneePart = isUuid(task && task.memberUserId) ? task.memberUserId : '';
+    const fallback = `${titlePart}:${startDatePart}:${startTimePart}:${assigneePart}`;
+    const stablePart = localTaskId || fallback;
+    return `task-create:${workspacePart}:${stablePart}`.slice(0, 128);
+}
+
 function normalizeIsoTimestamp(value) {
     if (typeof value !== 'string' || !value.trim()) return '';
     const parsed = new Date(value);
@@ -1533,9 +1671,20 @@ function shouldUpdateRemoteTask(remoteTask, payload) {
 function resolveRemoteSyncErrorMessage(error) {
     if (error && typeof error === 'object') {
         const status = Number(error.status || 0);
+        const code = normalizeErrorCode(readErrorCodeFromError(error));
         const message = typeof error.message === 'string' ? error.message.trim() : '';
-        if (status === 401 || status === 403) {
+        const normalizedMessage = message.toUpperCase();
+        if (SESSION_ERROR_CODES.has(code)) {
             return 'Session expired. Please sign in again to save data to database.';
+        }
+        if (
+            code === 'AUTH_UPSTREAM_UNAVAILABLE' ||
+            normalizedMessage.includes('AUTHENTICATION UPSTREAM UNAVAILABLE')
+        ) {
+            return 'Sync is temporarily delayed. Changes will retry automatically.';
+        }
+        if (status === 403) {
+            return 'You do not have permission to sync some workspace changes.';
         }
         if (message) {
             return message;
@@ -1546,6 +1695,16 @@ function resolveRemoteSyncErrorMessage(error) {
 
 function notifyRemoteSyncError(error) {
     const message = resolveRemoteSyncErrorMessage(error);
+    const code = normalizeErrorCode(readErrorCodeFromError(error));
+    const status = Number(error && typeof error === 'object' ? error.status || 0 : 0);
+    const rawMessage =
+        error && typeof error === 'object' && typeof error.message === 'string'
+            ? error.message.toUpperCase()
+            : '';
+    const isUpstreamTemporaryError =
+        code === 'AUTH_UPSTREAM_UNAVAILABLE' ||
+        rawMessage.includes('AUTHENTICATION UPSTREAM UNAVAILABLE') ||
+        status === 503;
     const now = Date.now();
     const shouldThrottle =
         state.remoteSync.lastErrorMessage === message &&
@@ -1555,6 +1714,10 @@ function notifyRemoteSyncError(error) {
 
     state.remoteSync.lastErrorAt = now;
     state.remoteSync.lastErrorMessage = message;
+    if (isUpstreamTemporaryError) {
+        showSyncToast(message, false);
+        return;
+    }
     showErrorToast(message, 'Sync Failed');
 }
 
@@ -1875,7 +2038,7 @@ function resolveProjectWorkspaceId(project, availableWorkspaceIds = []) {
     return availableWorkspaceIds[0] || '';
 }
 
-async function loadStateFromRemote() {
+async function loadStateFromRemote(options = {}) {
     if (!hasTaskApiClient()) return null;
     if (!window.OrbitTaskApi.getToken()) return null;
 
@@ -1888,6 +2051,7 @@ async function loadStateFromRemote() {
             state.remoteSync.workspaceId && isUuid(state.remoteSync.workspaceId)
                 ? state.remoteSync.workspaceId
                 : (workspaceIds[0] || '');
+        const nextWorkspaceDisplaySettings = {};
 
         const mappedProjects = await mapWithConcurrency(
             workspaces,
@@ -1899,6 +2063,10 @@ async function loadStateFromRemote() {
                 }
 
                 try {
+                    const workspaceSettings = normalizeWorkspaceSettingsRecord(
+                        workspace && typeof workspace.settings === 'object' ? workspace.settings : {}
+                    );
+                    nextWorkspaceDisplaySettings[workspaceId] = workspaceSettings;
                     const [board, calendar, membersResponse] = await Promise.all([
                         window.OrbitTaskApi.getWorkspaceBoard(workspaceId, { workspaceId }),
                         window.OrbitTaskApi.getWorkspaceCalendar(
@@ -1938,36 +2106,13 @@ async function loadStateFromRemote() {
                         ownerUserId: typeof (workspace && workspace.ownerUserId) === 'string' ? workspace.ownerUserId : '',
                         workspaceId,
                         visibility: 'WORKSPACE',
-                        startDate: (
-                            state.workspaceDisplaySettings &&
-                            state.workspaceDisplaySettings[workspaceId] &&
-                            state.workspaceDisplaySettings[workspaceId].startDate
-                        ) || '',
-                        endDate: (
-                            state.workspaceDisplaySettings &&
-                            state.workspaceDisplaySettings[workspaceId] &&
-                            state.workspaceDisplaySettings[workspaceId].endDate
-                        ) || '',
-                        hourFormat: (
-                            state.workspaceDisplaySettings &&
-                            state.workspaceDisplaySettings[workspaceId] &&
-                            state.workspaceDisplaySettings[workspaceId].hourFormat
-                        ) || '24',
-                        showWeekends: (
-                            state.workspaceDisplaySettings &&
-                            state.workspaceDisplaySettings[workspaceId] &&
-                            typeof state.workspaceDisplaySettings[workspaceId].showWeekends === 'boolean'
-                        ) ? state.workspaceDisplaySettings[workspaceId].showWeekends : true,
-                        weekStart: (
-                            state.workspaceDisplaySettings &&
-                            state.workspaceDisplaySettings[workspaceId] &&
-                            state.workspaceDisplaySettings[workspaceId].weekStart
-                        ) || 'mon',
-                        defaultDurationHours: (
-                            state.workspaceDisplaySettings &&
-                            state.workspaceDisplaySettings[workspaceId] &&
-                            state.workspaceDisplaySettings[workspaceId].defaultDuration
-                        ) || 2,
+                        settings: workspaceSettings,
+                        startDate: workspaceSettings.startDate,
+                        endDate: workspaceSettings.endDate,
+                        hourFormat: workspaceSettings.hourFormat,
+                        showWeekends: workspaceSettings.showWeekends,
+                        weekStart: workspaceSettings.weekStart,
+                        defaultDurationHours: workspaceSettings.defaultDuration,
                         defaultView:
                             (calendar && calendar.project && String(calendar.project.defaultView || '').toUpperCase() === 'CALENDAR')
                                 || (board && board.project && String(board.project.defaultView || '').toUpperCase() === 'CALENDAR')
@@ -1995,6 +2140,7 @@ async function loadStateFromRemote() {
         if (normalizedProjects.length === 0) {
             throw new Error('No workspace state available from remote');
         }
+        state.workspaceDisplaySettings = nextWorkspaceDisplaySettings;
 
         if (!normalizedProjects.some((project) => project.active)) {
             const fallbackProject =
@@ -2008,9 +2154,248 @@ async function loadStateFromRemote() {
         return normalizedProjects;
     } catch (error) {
         console.warn('Unable to load remote project state:', error);
-        showErrorToast('Unable to load workspaces from server. Please refresh or try again.', 'Load Failed');
+        const silent = options && options.silent === true;
+        if (!silent) {
+            showErrorToast('Unable to load workspaces from server. Please refresh or try again.', 'Load Failed');
+        }
         return null;
     }
+}
+
+function applyRemoteProjectsSnapshot(remoteProjects, options = {}) {
+    const preserveActiveProjectId = typeof options.preserveActiveProjectId === 'string'
+        ? options.preserveActiveProjectId
+        : '';
+    const previousActiveProjectId =
+        preserveActiveProjectId || (state.projects.find((project) => project.active) || {}).id || '';
+
+    state.remoteSync.hydrating = true;
+    state.projects = normalizeProjectsCollection(remoteProjects);
+    assignMissingWorkspaceIds();
+    hydrateProjectAccessMetadata();
+    restoreActiveProjectById(previousActiveProjectId);
+
+    const activeProject = getActiveProject();
+    const activeWorkspaceId = getProjectWorkspaceId(activeProject);
+    if (activeWorkspaceId) {
+        applyActiveWorkspace(activeWorkspaceId);
+    }
+
+    state.remoteSync.hydrating = false;
+    clearPendingSyncSnapshot();
+    persistLocalProjectsSnapshot();
+    markRemoteLoadedInSession();
+    writeLastSyncedAt(Date.now());
+}
+
+async function refreshRemoteProjects(options = {}) {
+    const remoteProjects = await loadStateFromRemote(options);
+    if (!Array.isArray(remoteProjects)) {
+        return false;
+    }
+    applyRemoteProjectsSnapshot(remoteProjects, options);
+    return true;
+}
+
+function queueRealtimeInvalidateRefresh() {
+    if (state.authFailures.locked) {
+        return;
+    }
+
+    state.realtimeInvalidate.pending = true;
+    if (state.realtimeInvalidate.timer) {
+        clearTimeout(state.realtimeInvalidate.timer);
+    }
+
+    state.realtimeInvalidate.timer = setTimeout(async () => {
+        state.realtimeInvalidate.timer = null;
+
+        if (state.realtimeInvalidate.inFlight) {
+            return;
+        }
+
+        state.realtimeInvalidate.pending = false;
+        state.realtimeInvalidate.inFlight = true;
+        try {
+            await refreshRemoteProjects({
+                silent: true,
+                preserveActiveProjectId: (getActiveProject() || {}).id || ''
+            });
+        } finally {
+            state.realtimeInvalidate.inFlight = false;
+            if (state.realtimeInvalidate.pending) {
+                queueRealtimeInvalidateRefresh();
+            }
+        }
+    }, REALTIME_INVALIDATE_DEBOUNCE_MS);
+}
+
+function clearRealtimeTaskFallbackTimer() {
+    if (state.realtimeInvalidate.taskFallbackTimer) {
+        clearTimeout(state.realtimeInvalidate.taskFallbackTimer);
+        state.realtimeInvalidate.taskFallbackTimer = null;
+    }
+}
+
+function queueTaskInvalidateFallbackRefresh() {
+    if (state.authFailures.locked) {
+        return;
+    }
+    if (state.realtimeInvalidate.taskFallbackTimer) {
+        return;
+    }
+    state.realtimeInvalidate.taskFallbackTimer = setTimeout(() => {
+        state.realtimeInvalidate.taskFallbackTimer = null;
+        if (state.authFailures.locked) {
+            return;
+        }
+        const elapsedSinceTaskDelta = Date.now() - Number(state.realtimeInvalidate.lastTaskDeltaAt || 0);
+        if (elapsedSinceTaskDelta <= REALTIME_TASK_INVALIDATE_RECENT_DELTA_MS) {
+            return;
+        }
+        queueRealtimeInvalidateRefresh();
+    }, REALTIME_TASK_INVALIDATE_FALLBACK_MS);
+}
+
+function normalizeTaskDeltaPayload(payload) {
+    if (!payload || typeof payload !== 'object') {
+        return null;
+    }
+
+    const workspaceId = isUuid(payload.workspaceId) ? payload.workspaceId : '';
+    const taskId = typeof payload.taskId === 'string' ? payload.taskId.trim() : '';
+    const operationRaw = typeof payload.operation === 'string' ? payload.operation.trim().toLowerCase() : '';
+    const operation = ['create', 'update', 'move', 'delete'].includes(operationRaw)
+        ? operationRaw
+        : '';
+    const projectId = typeof payload.projectId === 'string' ? payload.projectId.trim() : '';
+    const taskPatch =
+        payload.taskPatch && typeof payload.taskPatch === 'object' && !Array.isArray(payload.taskPatch)
+            ? payload.taskPatch
+            : null;
+
+    if (!workspaceId || !taskId || !operation) {
+        return null;
+    }
+
+    return {
+        workspaceId,
+        taskId,
+        operation,
+        projectId,
+        taskPatch
+    };
+}
+
+function applyWorkspaceTaskDelta(payload) {
+    const delta = normalizeTaskDeltaPayload(payload);
+    if (!delta) {
+        return false;
+    }
+
+    const project = state.projects.find((entry) => {
+        const workspaceId = getProjectWorkspaceId(entry) || (isUuid(entry && entry.id) ? entry.id : '');
+        return workspaceId === delta.workspaceId;
+    });
+    if (!project || !Array.isArray(project.tasks)) {
+        return false;
+    }
+
+    const existingIndex = project.tasks.findIndex((task) => task && task.id === delta.taskId);
+    let changed = false;
+
+    if (delta.operation === 'delete') {
+        if (existingIndex >= 0) {
+            project.tasks.splice(existingIndex, 1);
+            changed = true;
+        }
+    } else {
+        const hasPatchObject =
+            delta.taskPatch && typeof delta.taskPatch === 'object' && !Array.isArray(delta.taskPatch);
+        if (!hasPatchObject) {
+            return false;
+        }
+
+        const patch = { ...delta.taskPatch };
+        const hasPatchData = [
+            'title',
+            'status',
+            'priority',
+            'description',
+            'startAt',
+            'dueAt',
+            'assigneeUserId'
+        ].some((key) => key in patch);
+        if (!hasPatchData) {
+            return false;
+        }
+
+        if (!patch.id) {
+            patch.id = delta.taskId;
+        }
+        if (!patch.projectId && delta.projectId) {
+            patch.projectId = delta.projectId;
+        }
+
+        const normalizedTask = mapRemoteTaskToLocal(patch, existingIndex >= 0 ? existingIndex : project.tasks.length);
+        const nextTaskId = normalizedTask && typeof normalizedTask.id === 'string' ? normalizedTask.id : delta.taskId;
+        const taskIndex = existingIndex >= 0
+            ? existingIndex
+            : project.tasks.findIndex((task) => task && task.id === nextTaskId);
+
+        if (taskIndex >= 0) {
+            project.tasks.splice(taskIndex, 1, normalizedTask);
+        } else {
+            project.tasks.push(normalizedTask);
+        }
+        changed = true;
+    }
+
+    if (!changed) {
+        return false;
+    }
+
+    persistLocalProjectsSnapshot();
+    const activeProject = getActiveProject();
+    const activeWorkspaceId = getProjectWorkspaceId(activeProject);
+    if ((activeProject && activeProject.id === project.id) || activeWorkspaceId === delta.workspaceId) {
+        updateUIAfterProjectSwitch();
+    }
+    return true;
+}
+
+function connectRealtimeSync() {
+    if (!realtimeSync || typeof realtimeSync.connect !== 'function') {
+        return;
+    }
+    realtimeSync.connect({
+        workspaceId: state.remoteSync.workspaceId,
+        onInvalidate: (payload) => {
+            const resource = payload && typeof payload === 'object' && typeof payload.resource === 'string'
+                ? payload.resource.trim().toLowerCase()
+                : '';
+            if (resource === 'tasks') {
+                queueRealtimeInvalidateRefresh();
+                queueTaskInvalidateFallbackRefresh();
+                return;
+            }
+            queueRealtimeInvalidateRefresh();
+        },
+        onTaskDelta: (payload) => {
+            const applied = applyWorkspaceTaskDelta(payload);
+            if (applied) {
+                state.realtimeInvalidate.lastTaskDeltaAt = Date.now();
+                clearRealtimeTaskFallbackTimer();
+                return;
+            }
+            queueRealtimeInvalidateRefresh();
+        },
+        onAuthFailure: (detail) => {
+            if (isSessionAuthFailure(detail)) {
+                registerSessionAuthFailure(detail);
+            }
+        }
+    });
 }
 
 function normalizeWorkspaceDefaultDuration(value, fallback = 2) {
@@ -2040,40 +2425,52 @@ function normalizeWorkspaceDate(value) {
     return isISODate(value) ? String(value) : '';
 }
 
+function normalizeWorkspaceSettingsRecord(source = {}, fallback = {}) {
+    const record = source && typeof source === 'object' ? source : {};
+    const fallbackRecord = fallback && typeof fallback === 'object' ? fallback : {};
+    const hasOwn = (key) => Object.prototype.hasOwnProperty.call(record, key);
+    return {
+        startDate: normalizeWorkspaceDate(
+            hasOwn('startDate') ? record.startDate : (fallbackRecord.startDate || '')
+        ),
+        endDate: normalizeWorkspaceDate(
+            hasOwn('endDate') ? record.endDate : (fallbackRecord.endDate || '')
+        ),
+        hourFormat: normalizeWorkspaceHourFormat(
+            record.hourFormat !== undefined ? record.hourFormat : fallbackRecord.hourFormat,
+            '24'
+        ),
+        showWeekends: normalizeWorkspaceShowWeekends(
+            record.showWeekends !== undefined ? record.showWeekends : fallbackRecord.showWeekends,
+            true
+        ),
+        weekStart: normalizeWorkspaceWeekStart(
+            record.weekStart !== undefined ? record.weekStart : fallbackRecord.weekStart,
+            'mon'
+        ),
+        defaultDuration: normalizeWorkspaceDefaultDuration(
+            record.defaultDurationHours !== undefined
+                ? record.defaultDurationHours
+                : (
+                    record.defaultDuration !== undefined
+                        ? record.defaultDuration
+                        : (
+                            fallbackRecord.defaultDurationHours !== undefined
+                                ? fallbackRecord.defaultDurationHours
+                                : fallbackRecord.defaultDuration
+                        )
+                ),
+            2
+        ),
+    };
+}
+
 function readWorkspaceDisplaySettings() {
-    try {
-        const raw = safeParseJSON(localStorage.getItem(WORKSPACE_DISPLAY_SETTINGS_STORAGE_KEY));
-        if (!raw || typeof raw !== 'object') return {};
-        const sanitized = {};
-        Object.keys(raw).forEach((workspaceId) => {
-            if (!isUuid(workspaceId)) return;
-            const row = raw[workspaceId];
-            if (!row || typeof row !== 'object') return;
-            sanitized[workspaceId] = {
-                startDate: normalizeWorkspaceDate(row.startDate),
-                endDate: normalizeWorkspaceDate(row.endDate),
-                hourFormat: normalizeWorkspaceHourFormat(row.hourFormat, '24'),
-                showWeekends: normalizeWorkspaceShowWeekends(row.showWeekends, true),
-                weekStart: normalizeWorkspaceWeekStart(row.weekStart, 'mon'),
-                defaultDuration: normalizeWorkspaceDefaultDuration(row.defaultDuration, 2),
-            };
-        });
-        return sanitized;
-    } catch (error) {
-        console.warn('Unable to read workspace display settings:', error);
-        return {};
-    }
+    return {};
 }
 
 function persistWorkspaceDisplaySettings() {
-    try {
-        localStorage.setItem(
-            WORKSPACE_DISPLAY_SETTINGS_STORAGE_KEY,
-            JSON.stringify(state.workspaceDisplaySettings || {})
-        );
-    } catch (error) {
-        console.warn('Unable to persist workspace display settings:', error);
-    }
+    return undefined;
 }
 
 function getProjectTimelineStartDate(project) {
@@ -2250,7 +2647,14 @@ async function syncProjectTasks(project) {
             continue;
         }
 
-        const created = await window.OrbitTaskApi.createWorkspaceTask(workspaceId, payload, { workspaceId });
+        const created = await window.OrbitTaskApi.createWorkspaceTask(
+            workspaceId,
+            payload,
+            {
+                workspaceId,
+                idempotencyKey: buildTaskCreateIdempotencyKey(task, workspaceId)
+            }
+        );
         if (created && typeof created.id === 'string') {
             task.id = created.id;
             localTaskIds.add(created.id);
@@ -2389,22 +2793,7 @@ async function loadState() {
 
     const remoteProjects = await loadStateFromRemote();
     if (Array.isArray(remoteProjects)) {
-        const previousActiveProjectId = (state.projects.find((project) => project.active) || {}).id || '';
-        state.remoteSync.hydrating = true;
-        state.projects = normalizeProjectsCollection(remoteProjects);
-        assignMissingWorkspaceIds();
-        hydrateProjectAccessMetadata();
-        restoreActiveProjectById(previousActiveProjectId);
-        const activeProject = getActiveProject();
-        const activeWorkspaceId = getProjectWorkspaceId(activeProject);
-        if (activeWorkspaceId) {
-            applyActiveWorkspace(activeWorkspaceId);
-        }
-        state.remoteSync.hydrating = false;
-        clearPendingSyncSnapshot();
-        persistLocalProjectsSnapshot();
-        markRemoteLoadedInSession();
-        writeLastSyncedAt(Date.now());
+        applyRemoteProjectsSnapshot(remoteProjects);
         return;
     }
 
@@ -2494,6 +2883,9 @@ async function bootstrapProjectPage() {
     }
     const user = await auth.requireAuth('/signin/');
     if (!user) return;
+    state.authFailures.locked = false;
+    resetAuthFailureState();
+    attachTaskAuthWatchers();
     const storedWorkspaceId = localStorage.getItem(ACTIVE_WORKSPACE_STORAGE_KEY) || '';
     if (isUuid(storedWorkspaceId)) {
         state.remoteSync.workspaceId = storedWorkspaceId;
@@ -2518,6 +2910,7 @@ async function bootstrapProjectPage() {
     setBoardViewMode(state.viewMode, { persist: false, skipLayout: true });
     renderProjects();
     updateUIAfterProjectSwitch();
+    connectRealtimeSync();
 
     const params = new URLSearchParams(window.location.search || '');
     const shouldOpenWorkspaceSettings = ['1', 'true', 'yes'].includes(
@@ -2813,9 +3206,6 @@ function initTimeline(taskDates = []) {
         return;
     }
 
-    const first = fromISODate(allDates[0]);
-    const last = fromISODate(allDates[allDates.length - 1]);
-    const shortFmt = new Intl.DateTimeFormat('vi-VN', { day: '2-digit', month: '2-digit', year: 'numeric' });
     // Header time-range label was removed; timeline remains unchanged.
 }
 
@@ -3043,6 +3433,14 @@ async function saveWorkspaceSettings() {
         durationInput.value,
         state.settings?.timeline?.defaultDuration || 2
     );
+    const nextWorkspaceSettingsPayload = {
+        startDate: nextStartDate || null,
+        endDate: nextEndDate || null,
+        hourFormat: nextHourFormat,
+        showWeekends: nextShowWeekends,
+        weekStart: nextWeekStart,
+        defaultDurationHours: nextDefaultDuration,
+    };
 
     if (mode === 'create') {
         if (!hasTaskApiClient() || !window.OrbitTaskApi.getToken()) {
@@ -3059,20 +3457,25 @@ async function saveWorkspaceSettings() {
             return;
         }
         setWorkspaceSettingsBusy(true);
+        let createdWorkspaceId = '';
         try {
             const created = await window.OrbitTaskApi.createWorkspace({ name: nextName });
             if (!created || !isUuid(created.id)) {
                 throw new Error('Unable to create workspace');
             }
-            state.workspaceDisplaySettings[created.id] = {
-                startDate: nextStartDate,
-                endDate: nextEndDate,
-                hourFormat: nextHourFormat,
-                showWeekends: nextShowWeekends,
-                weekStart: nextWeekStart,
-                defaultDuration: nextDefaultDuration,
-            };
-            persistWorkspaceDisplaySettings();
+            createdWorkspaceId = created.id;
+            const savedSettingsRaw = typeof window.OrbitTaskApi.updateWorkspaceSettings === 'function'
+                ? await window.OrbitTaskApi.updateWorkspaceSettings(
+                    created.id,
+                    nextWorkspaceSettingsPayload,
+                    { workspaceId: created.id }
+                )
+                : nextWorkspaceSettingsPayload;
+            const savedSettings = normalizeWorkspaceSettingsRecord(
+                savedSettingsRaw,
+                nextWorkspaceSettingsPayload
+            );
+            state.workspaceDisplaySettings[created.id] = savedSettings;
 
             const localCreatedProject = sanitizeProject({
                 id: created.id,
@@ -3081,12 +3484,20 @@ async function saveWorkspaceSettings() {
                 workspaceId: created.id,
                 ownerUserId: typeof created.ownerUserId === 'string' ? created.ownerUserId : '',
                 workspaceRole: typeof created.role === 'string' ? created.role : 'OWNER',
-                startDate: nextStartDate,
-                endDate: nextEndDate,
-                hourFormat: nextHourFormat,
-                showWeekends: nextShowWeekends,
-                weekStart: nextWeekStart,
-                defaultDurationHours: nextDefaultDuration,
+                settings: {
+                    startDate: savedSettings.startDate,
+                    endDate: savedSettings.endDate,
+                    hourFormat: savedSettings.hourFormat,
+                    showWeekends: savedSettings.showWeekends,
+                    weekStart: savedSettings.weekStart,
+                    defaultDurationHours: savedSettings.defaultDuration,
+                },
+                startDate: savedSettings.startDate,
+                endDate: savedSettings.endDate,
+                hourFormat: savedSettings.hourFormat,
+                showWeekends: savedSettings.showWeekends,
+                weekStart: savedSettings.weekStart,
+                defaultDurationHours: savedSettings.defaultDuration,
                 members: [],
                 tasks: []
             }, state.projects.length);
@@ -3123,9 +3534,18 @@ async function saveWorkspaceSettings() {
             return;
         } catch (error) {
             console.warn('Unable to create workspace', error);
-            showErrorToast('Unable to create workspace right now. Please try again.', 'Workspace Create Failed', {
-                code: 'WORKSPACE_CREATE_FAILED'
-            });
+            if (createdWorkspaceId) {
+                void refreshRemoteProjects({ silent: true });
+                showErrorToast(
+                    'The workspace was created, but its settings could not be saved. The dashboard has been reloaded from the server.',
+                    'Workspace Settings Failed',
+                    { code: 'WORKSPACE_SETTINGS_SYNC_FAILED' }
+                );
+            } else {
+                showErrorToast('Unable to create workspace right now. Please try again.', 'Workspace Create Failed', {
+                    code: 'WORKSPACE_CREATE_FAILED'
+                });
+            }
             return;
         } finally {
             setWorkspaceSettingsBusy(false);
@@ -3153,60 +3573,96 @@ async function saveWorkspaceSettings() {
     }
     setWorkspaceSettingsBusy(true);
 
-    const previousName = activeProject.name;
-    const previousStartDate = getProjectTimelineStartDate(activeProject);
-    const previousEndDate = getProjectTimelineEndDate(activeProject);
-    const previousHourFormat = getProjectHourFormat(activeProject);
-    const previousShowWeekends = getProjectShowWeekends(activeProject);
-    const previousWeekStart = getProjectWeekStart(activeProject);
-    const previousDefaultDuration = getProjectDefaultDurationHours(activeProject);
     try {
-        activeProject.name = nextName;
+        let savedName = nextName;
+        let savedSettings = normalizeWorkspaceSettingsRecord(nextWorkspaceSettingsPayload, nextWorkspaceSettingsPayload);
+
+        if (
+            workspaceId &&
+            hasTaskApiClient() &&
+            window.OrbitTaskApi.getToken() &&
+            typeof window.OrbitTaskApi.updateWorkspace === 'function' &&
+            typeof window.OrbitTaskApi.updateWorkspaceSettings === 'function'
+        ) {
+            const [workspaceResult, settingsResult] = await Promise.allSettled([
+                window.OrbitTaskApi.updateWorkspace(
+                    workspaceId,
+                    { name: nextName },
+                    { workspaceId }
+                ),
+                window.OrbitTaskApi.updateWorkspaceSettings(
+                    workspaceId,
+                    nextWorkspaceSettingsPayload,
+                    { workspaceId }
+                )
+            ]);
+
+            if (workspaceResult.status !== 'fulfilled' || settingsResult.status !== 'fulfilled') {
+                console.warn('Unable to update workspace settings remotely:', {
+                    workspaceResult,
+                    settingsResult,
+                });
+
+                try {
+                    if (
+                        typeof window.OrbitTaskApi.getWorkspace === 'function' &&
+                        typeof window.OrbitTaskApi.getWorkspaceSettings === 'function'
+                    ) {
+                        const [serverWorkspace, serverSettings] = await Promise.all([
+                            window.OrbitTaskApi.getWorkspace(workspaceId, { workspaceId }),
+                            window.OrbitTaskApi.getWorkspaceSettings(workspaceId, { workspaceId }),
+                        ]);
+                        activeProject.name = sanitizeText(serverWorkspace && serverWorkspace.name, 80) || activeProject.name;
+                        const normalizedServerSettings = normalizeWorkspaceSettingsRecord(
+                            serverSettings || (serverWorkspace && serverWorkspace.settings),
+                            nextWorkspaceSettingsPayload
+                        );
+                        state.workspaceDisplaySettings[workspaceId] = normalizedServerSettings;
+                        setProjectWorkspaceDisplaySettings(activeProject, {
+                            startDate: normalizedServerSettings.startDate,
+                            endDate: normalizedServerSettings.endDate,
+                            hourFormat: normalizedServerSettings.hourFormat,
+                            showWeekends: normalizedServerSettings.showWeekends,
+                            weekStart: normalizedServerSettings.weekStart,
+                            defaultDuration: normalizedServerSettings.defaultDuration,
+                        });
+                    } else {
+                        await refreshRemoteProjects({ silent: true, preserveActiveProjectId: activeProject.id });
+                    }
+                } catch (resyncError) {
+                    console.warn('Unable to resync workspace settings after partial failure:', resyncError);
+                    await refreshRemoteProjects({ silent: true, preserveActiveProjectId: activeProject.id });
+                }
+
+                renderProjects();
+                updateUIAfterProjectSwitch();
+                showErrorToast('Unable to save workspace settings to the server. The dashboard has been reloaded from the latest saved data.', 'Update Failed', {
+                    code: 'WORKSPACE_SETTINGS_SYNC_FAILED'
+                });
+                return;
+            }
+
+            savedName = sanitizeText(workspaceResult.value && workspaceResult.value.name, 80) || nextName;
+            savedSettings = normalizeWorkspaceSettingsRecord(settingsResult.value, nextWorkspaceSettingsPayload);
+        }
+
+        activeProject.name = savedName;
+        if (workspaceId) {
+            state.workspaceDisplaySettings[workspaceId] = savedSettings;
+        }
         setProjectWorkspaceDisplaySettings(activeProject, {
-            startDate: nextStartDate,
-            endDate: nextEndDate,
-            hourFormat: nextHourFormat,
-            showWeekends: nextShowWeekends,
-            weekStart: nextWeekStart,
-            defaultDuration: nextDefaultDuration,
+            startDate: savedSettings.startDate,
+            endDate: savedSettings.endDate,
+            hourFormat: savedSettings.hourFormat,
+            showWeekends: savedSettings.showWeekends,
+            weekStart: savedSettings.weekStart,
+            defaultDuration: savedSettings.defaultDuration,
         });
         state.didInitialScroll = false;
         saveState({ immediate: true });
         renderProjects();
         updateUIAfterProjectSwitch();
         closeModals();
-
-        if (
-            workspaceId &&
-            hasTaskApiClient() &&
-            window.OrbitTaskApi.getToken() &&
-            typeof window.OrbitTaskApi.updateWorkspace === 'function'
-        ) {
-            try {
-                await window.OrbitTaskApi.updateWorkspace(
-                    workspaceId,
-                    { name: nextName },
-                    { workspaceId }
-                );
-            } catch (error) {
-                console.warn('Unable to update workspace settings remotely:', error);
-                activeProject.name = previousName;
-                setProjectWorkspaceDisplaySettings(activeProject, {
-                    startDate: previousStartDate,
-                    endDate: previousEndDate,
-                    hourFormat: previousHourFormat,
-                    showWeekends: previousShowWeekends,
-                    weekStart: previousWeekStart,
-                    defaultDuration: previousDefaultDuration,
-                });
-                saveState({ immediate: true });
-                renderProjects();
-                updateUIAfterProjectSwitch();
-                showErrorToast('Unable to save workspace settings to server. Local changes were reverted.', 'Update Failed', {
-                    code: 'WORKSPACE_SETTINGS_SYNC_FAILED'
-                });
-            }
-        }
     } finally {
         setWorkspaceSettingsBusy(false);
         releaseMutationLock(updateLockKey);
@@ -3538,8 +3994,7 @@ function setupEventListeners() {
             layoutAllTasks();
         }
         if (e.key === WORKSPACE_DISPLAY_SETTINGS_STORAGE_KEY) {
-            state.workspaceDisplaySettings = readWorkspaceDisplaySettings();
-            layoutAllTasks();
+            return;
         }
     });
     window.addEventListener('pagehide', () => {
@@ -3547,12 +4002,26 @@ function setupEventListeners() {
             clearTimeout(state.filters.debounceTimer);
             state.filters.debounceTimer = null;
         }
+        if (state.realtimeInvalidate.timer) {
+            clearTimeout(state.realtimeInvalidate.timer);
+            state.realtimeInvalidate.timer = null;
+        }
+        clearRealtimeTaskFallbackTimer();
+        state.realtimeInvalidate.lastTaskDeltaAt = 0;
+        if (typeof window.removeEventListener === 'function') {
+            window.removeEventListener(TASK_AUTH_FAILURE_EVENT, handleTaskAuthFailureEvent);
+            window.removeEventListener(TASK_AUTH_SUCCESS_EVENT, handleTaskAuthSuccessEvent);
+        }
         clearConnectionProbeTimer();
         if (realtimeSync && typeof realtimeSync.disconnect === 'function') {
             realtimeSync.disconnect();
         }
     });
     window.addEventListener('pageshow', () => {
+        if (!state.authFailures.locked) {
+            attachTaskAuthWatchers();
+            connectRealtimeSync();
+        }
         scheduleConnectionProbe(true);
     });
     document.addEventListener('visibilitychange', () => {
@@ -4596,166 +5065,182 @@ function saveTask() {
         return;
     }
 
-    try {
-        const taskInput = assertElementById('taskInput', 'TASK_SAVE_DOM_MISSING');
-        const startAtInput = assertElementById('taskStartAtInput', 'TASK_SAVE_DOM_MISSING');
-        const endAtInput = assertElementById('taskEndAtInput', 'TASK_SAVE_DOM_MISSING');
-        const statusSelect = assertElementById('taskStatusSelect', 'TASK_SAVE_DOM_MISSING');
-        const prioritySelect = assertElementById('taskPrioritySelect', 'TASK_SAVE_DOM_MISSING');
-        const taskNoteInput = assertElementById('taskNote', 'TASK_SAVE_DOM_MISSING');
-        const taskImageInput = assertElementById('taskImageUrl', 'TASK_SAVE_DOM_MISSING');
-        const memberSelect = assertElementById('taskMembersSelect', 'TASK_SAVE_DOM_MISSING');
-
-        const name = sanitizeText(taskInput.value, 120);
-        const startAtRaw = startAtInput.value;
-        const endAtRaw = endAtInput.value;
-        const startAt = parseDateTimeLocal(startAtRaw);
-        const endAt = parseDateTimeLocal(endAtRaw);
-        const startDate = startAt ? startAt.date : '';
-        const startTime = startAt ? startAt.time : '';
-        const endDate = endAt ? endAt.date : '';
-        const endTime = endAt ? endAt.time : '';
-        const status = statusSelect.value;
-        const priority = prioritySelect.value;
-
-        if (!memberSelect.options || typeof memberSelect.selectedIndex !== 'number') {
-            throw createTaskFlowError(
-                'TASK_SAVE_DOM_MISSING',
-                'Assignee selector is unavailable. Please refresh and try again.',
-                { elementId: 'taskMembersSelect' }
-            );
-        }
-        const selectedMemberOption = memberSelect.options[memberSelect.selectedIndex] || null;
-        const selectedMemberValue = sanitizeText(memberSelect.value, 120);
-        const memberUserId = isUuid(selectedMemberValue) ? selectedMemberValue : '';
-        const memberName = sanitizeText(
-            selectedMemberOption && selectedMemberOption.dataset.memberName
-                ? selectedMemberOption.dataset.memberName
-                : (memberUserId ? normalizeMemberLabel(memberUserId) : selectedMemberValue),
-            40
+    const mutationLockKey = currentTaskData && typeof currentTaskData.id === 'string' && currentTaskData.id
+        ? `task:save:${currentTaskData.id}`
+        : `task:save:new:${activeProject.id}`;
+    if (!acquireMutationLock(mutationLockKey)) {
+        showErrorToast(
+            'Task save is in progress. Please wait a moment.',
+            'Task Busy',
+            { code: 'TASK_SAVE_LOCKED' }
         );
-        const note = sanitizeNote(taskNoteInput.value);
-        const imageInput = taskImageInput.value.trim();
-        const image = sanitizeImageUrl(imageInput);
-        if (isMemberRestrictedEditor(activeProject)) {
-            const currentUserId = getCurrentUserId();
-            if (!currentUserId || memberUserId !== currentUserId) {
-                showTaskOwnershipDenied('create or edit tasks');
+        return;
+    }
+
+    try {
+        try {
+            const taskInput = assertElementById('taskInput', 'TASK_SAVE_DOM_MISSING');
+            const startAtInput = assertElementById('taskStartAtInput', 'TASK_SAVE_DOM_MISSING');
+            const endAtInput = assertElementById('taskEndAtInput', 'TASK_SAVE_DOM_MISSING');
+            const statusSelect = assertElementById('taskStatusSelect', 'TASK_SAVE_DOM_MISSING');
+            const prioritySelect = assertElementById('taskPrioritySelect', 'TASK_SAVE_DOM_MISSING');
+            const taskNoteInput = assertElementById('taskNote', 'TASK_SAVE_DOM_MISSING');
+            const taskImageInput = assertElementById('taskImageUrl', 'TASK_SAVE_DOM_MISSING');
+            const memberSelect = assertElementById('taskMembersSelect', 'TASK_SAVE_DOM_MISSING');
+
+            const name = sanitizeText(taskInput.value, 120);
+            const startAtRaw = startAtInput.value;
+            const endAtRaw = endAtInput.value;
+            const startAt = parseDateTimeLocal(startAtRaw);
+            const endAt = parseDateTimeLocal(endAtRaw);
+            const startDate = startAt ? startAt.date : '';
+            const startTime = startAt ? startAt.time : '';
+            const endDate = endAt ? endAt.date : '';
+            const endTime = endAt ? endAt.time : '';
+            const status = statusSelect.value;
+            const priority = prioritySelect.value;
+
+            if (!memberSelect.options || typeof memberSelect.selectedIndex !== 'number') {
+                throw createTaskFlowError(
+                    'TASK_SAVE_DOM_MISSING',
+                    'Assignee selector is unavailable. Please refresh and try again.',
+                    { elementId: 'taskMembersSelect' }
+                );
+            }
+            const selectedMemberOption = memberSelect.options[memberSelect.selectedIndex] || null;
+            const selectedMemberValue = sanitizeText(memberSelect.value, 120);
+            const memberUserId = isUuid(selectedMemberValue) ? selectedMemberValue : '';
+            const memberName = sanitizeText(
+                selectedMemberOption && selectedMemberOption.dataset.memberName
+                    ? selectedMemberOption.dataset.memberName
+                    : (memberUserId ? normalizeMemberLabel(memberUserId) : selectedMemberValue),
+                40
+            );
+            const note = sanitizeNote(taskNoteInput.value);
+            const imageInput = taskImageInput.value.trim();
+            const image = sanitizeImageUrl(imageInput);
+            if (isMemberRestrictedEditor(activeProject)) {
+                const currentUserId = getCurrentUserId();
+                if (!currentUserId || memberUserId !== currentUserId) {
+                    showTaskOwnershipDenied('create or edit tasks');
+                    return;
+                }
+            }
+            const defaultDurationHours = getProjectDefaultDurationHours(activeProject);
+            const maxWidth = state.hourWidth * DAY_HOURS;
+            const fallbackLeft = currentTaskData ? currentTaskData.left : 48;
+            const startMinutes = timeToMinutes(startTime);
+            const endMinutes = timeToMinutes(endTime);
+
+            let left = clamp(startMinutes !== null ? timeToLeft(startTime) : fallbackLeft, 0, maxWidth);
+            let width = state.hourWidth * defaultDurationHours;
+            if (startMinutes !== null && endMinutes !== null) {
+                if (startDate === endDate) {
+                    const durationMinutes = Math.max(15, endMinutes - startMinutes);
+                    width = (durationMinutes / 60) * state.hourWidth;
+                } else {
+                    width = maxWidth - left;
+                }
+            } else if (currentTaskData) {
+                width = currentTaskData.width;
+            }
+            width = clamp(width, state.hourWidth * 0.25, Math.max(state.hourWidth * 0.25, maxWidth - left));
+
+            const payload = {
+                id: currentTaskData ? currentTaskData.id : `task-${Date.now()}`,
+                name,
+                date: startDate,
+                startDate,
+                startTime,
+                endDate,
+                endTime,
+                status,
+                priority,
+                dueTime: endTime,
+                memberName,
+                memberUserId,
+                note,
+                image,
+                imageInput,
+                left,
+                width
+            };
+
+            const errors = validateTaskPayload(payload, activeProject);
+            if (errors.length > 0) {
+                const validationMessage = errors[0];
+                showErrorToast(validationMessage, 'Validation Error', { code: 'TASK_SAVE_VALIDATION_FAILED' });
+                showCustomConfirm({ title: 'Validation Error', message: errors[0] });
+                if (validationMessage === 'Task name is required.') {
+                    safeFocusById('taskInput');
+                } else if (validationMessage === 'Please select a valid start date.' || validationMessage === 'Please select a valid start time.') {
+                    safeFocusById('taskStartAtInput');
+                } else if (validationMessage === 'Please select a valid end date.') {
+                    safeFocusById('taskEndAtInput');
+                } else if (validationMessage === 'Please select a valid end time.' || validationMessage === 'End date/time must be after start date/time.') {
+                    safeFocusById('taskEndAtInput');
+                }
                 return;
             }
-        }
-        const defaultDurationHours = getProjectDefaultDurationHours(activeProject);
-        const maxWidth = state.hourWidth * DAY_HOURS;
-        const fallbackLeft = currentTaskData ? currentTaskData.left : 48;
-        const startMinutes = timeToMinutes(startTime);
-        const endMinutes = timeToMinutes(endTime);
 
-        let left = clamp(startMinutes !== null ? timeToLeft(startTime) : fallbackLeft, 0, maxWidth);
-        let width = state.hourWidth * defaultDurationHours;
-        if (startMinutes !== null && endMinutes !== null) {
-            if (startDate === endDate) {
-                const durationMinutes = Math.max(15, endMinutes - startMinutes);
-                width = (durationMinutes / 60) * state.hourWidth;
+            payload.left = clamp(payload.left, 0, maxWidth);
+            payload.width = clamp(payload.width, state.hourWidth * 0.25, Math.max(state.hourWidth * 0.25, maxWidth - payload.left));
+
+            if (!Array.isArray(activeProject.tasks)) {
+                activeProject.tasks = [];
+            }
+
+            const idx = activeProject.tasks.findIndex((task) => task.id === payload.id);
+            if (idx >= 0) {
+                activeProject.tasks[idx] = { ...activeProject.tasks[idx], ...payload };
             } else {
-                width = maxWidth - left;
+                activeProject.tasks.push(payload);
             }
-        } else if (currentTaskData) {
-            width = currentTaskData.width;
-        }
-        width = clamp(width, state.hourWidth * 0.25, Math.max(state.hourWidth * 0.25, maxWidth - left));
 
-        const payload = {
-            id: currentTaskData ? currentTaskData.id : `task-${Date.now()}`,
-            name,
-            date: startDate,
-            startDate,
-            startTime,
-            endDate,
-            endTime,
-            status,
-            priority,
-            dueTime: endTime,
-            memberName,
-            memberUserId,
-            note,
-            image,
-            imageInput,
-            left,
-            width
-        };
-
-        const errors = validateTaskPayload(payload, activeProject);
-        if (errors.length > 0) {
-            const validationMessage = errors[0];
-            showErrorToast(validationMessage, 'Validation Error', { code: 'TASK_SAVE_VALIDATION_FAILED' });
-            showCustomConfirm({ title: 'Validation Error', message: errors[0] });
-            if (validationMessage === 'Task name is required.') {
-                safeFocusById('taskInput');
-            } else if (validationMessage === 'Please select a valid start date.' || validationMessage === 'Please select a valid start time.') {
-                safeFocusById('taskStartAtInput');
-            } else if (validationMessage === 'Please select a valid end date.') {
-                safeFocusById('taskEndAtInput');
-            } else if (validationMessage === 'Please select a valid end time.' || validationMessage === 'End date/time must be after start date/time.') {
-                safeFocusById('taskEndAtInput');
+            try {
+                saveState({ immediate: true });
+                layoutAllTasks();
+            } catch (renderError) {
+                throw createTaskFlowError(
+                    'TASK_SAVE_RENDER_FAILED',
+                    'Task saved but UI refresh failed. Please reload to continue.',
+                    {
+                        taskId: payload.id,
+                        renderMessage: typeof renderError?.message === 'string' ? renderError.message : ''
+                    }
+                );
             }
-            return;
-        }
 
-        payload.left = clamp(payload.left, 0, maxWidth);
-        payload.width = clamp(payload.width, state.hourWidth * 0.25, Math.max(state.hourWidth * 0.25, maxWidth - payload.left));
-
-        if (!Array.isArray(activeProject.tasks)) {
-            activeProject.tasks = [];
-        }
-
-        const idx = activeProject.tasks.findIndex((task) => task.id === payload.id);
-        if (idx >= 0) {
-            activeProject.tasks[idx] = { ...activeProject.tasks[idx], ...payload };
-        } else {
-            activeProject.tasks.push(payload);
-        }
-
-        try {
-            saveState({ immediate: true });
-            layoutAllTasks();
-        } catch (renderError) {
-            throw createTaskFlowError(
-                'TASK_SAVE_RENDER_FAILED',
-                'Task saved but UI refresh failed. Please reload to continue.',
-                {
-                    taskId: payload.id,
-                    renderMessage: typeof renderError?.message === 'string' ? renderError.message : ''
-                }
+            const isVisibleAfterSave = applyTaskFilters(activeProject.tasks).some((task) => task.id === payload.id);
+            if (!isVisibleAfterSave) {
+                showErrorToast(
+                    'Task was saved but is hidden by current filters/search.',
+                    'Task Hidden',
+                    { code: 'TASK_SAVE_FILTER_HIDDEN' }
+                );
+            }
+            setTimeout(() => scrollToTaskSchedule(payload.startDate, payload.left), 40);
+            closeModals();
+        } catch (error) {
+            const meta = getTaskFlowErrorMeta(
+                error,
+                'TASK_SAVE_RUNTIME',
+                'Unexpected error while saving task. Please try again.'
             );
+            const context = getTaskDebugContext(activeProject, {
+                source: 'saveTask',
+                ...meta.context
+            });
+            console.error('Task save failed', {
+                code: meta.code,
+                message: meta.message,
+                context,
+                error
+            });
+            showErrorToast(meta.message, 'Task Save Failed', { code: meta.code });
         }
-
-        const isVisibleAfterSave = applyTaskFilters(activeProject.tasks).some((task) => task.id === payload.id);
-        if (!isVisibleAfterSave) {
-            showErrorToast(
-                'Task was saved but is hidden by current filters/search.',
-                'Task Hidden',
-                { code: 'TASK_SAVE_FILTER_HIDDEN' }
-            );
-        }
-        setTimeout(() => scrollToTaskSchedule(payload.startDate, payload.left), 40);
-        closeModals();
-    } catch (error) {
-        const meta = getTaskFlowErrorMeta(
-            error,
-            'TASK_SAVE_RUNTIME',
-            'Unexpected error while saving task. Please try again.'
-        );
-        const context = getTaskDebugContext(activeProject, {
-            source: 'saveTask',
-            ...meta.context
-        });
-        console.error('Task save failed', {
-            code: meta.code,
-            message: meta.message,
-            context,
-            error
-        });
-        showErrorToast(meta.message, 'Task Save Failed', { code: meta.code });
+    } finally {
+        releaseMutationLock(mutationLockKey);
     }
 }
 
@@ -4853,8 +5338,10 @@ function formatDisplayTime(hourDecimal) {
     const totalMinutes = Math.round(hour * 60);
     const hrs = Math.floor(totalMinutes / 60);
     const mins = totalMinutes % 60;
+    const activeProject = getActiveProject();
+    const hourFormat = getProjectHourFormat(activeProject);
 
-    if (state.settings?.timeline?.hourFormat === '12') {
+    if (hourFormat === '12') {
         const suffix = hrs >= 12 ? 'PM' : 'AM';
         const adjusted = hrs % 12 === 0 ? 12 : hrs % 12;
         return `${adjusted}:${String(mins).padStart(2, '0')} ${suffix}`;
@@ -4876,7 +5363,7 @@ function formatTaskSchedule(taskData) {
     const startDate = isISODate(taskData.startDate) ? taskData.startDate : taskData.date;
     const endDate = isISODate(taskData.endDate) ? taskData.endDate : startDate;
     if (startDate && endDate && startDate !== endDate) {
-        return `${baseRange} (${startDate} -> ${endDate})`;
+        return `${baseRange} (${formatDisplayDateRange(startDate, endDate)})`;
     }
     return baseRange;
 }
@@ -4886,7 +5373,10 @@ function formatTaskDateTimeSummary(taskData) {
     const endDate = isISODate(taskData.endDate) ? taskData.endDate : startDate;
     const startTime = isTimeValue(taskData.startTime) ? taskData.startTime : leftToTime(taskData.left);
     const endTime = isTimeValue(taskData.endTime) ? taskData.endTime : leftToTime(taskData.left + taskData.width);
-    return `${startDate} ${startTime} -> ${endDate} ${endTime}`;
+    return formatDisplayDateTimeRange(
+        { startDate, startTime, endDate, endTime },
+        getProjectHourFormat(getActiveProject())
+    );
 }
 
 function startResize(e, taskEl) {
@@ -5392,14 +5882,16 @@ function createKanbanTaskCard(taskData, activeProject, editable) {
     if (hasEndDate || hasEndTime) {
         const dueBadge = document.createElement('span');
         dueBadge.className = 'kanban-task-chip due';
-        if (hasEndDate && hasEndTime) {
-            dueBadge.textContent = `Due ${taskData.endDate} ${taskData.endTime}`;
-        } else if (hasEndDate) {
-            dueBadge.textContent = `Due ${taskData.endDate}`;
-        } else {
-            dueBadge.textContent = `Due ${taskData.endTime}`;
+        dueBadge.textContent = formatDueLabel(
+            {
+                date: hasEndDate ? taskData.endDate : '',
+                time: hasEndTime ? taskData.endTime : '',
+            },
+            getProjectHourFormat(getActiveProject())
+        );
+        if (dueBadge.textContent) {
+            badges.appendChild(dueBadge);
         }
-        badges.appendChild(dueBadge);
     }
     taskEl.appendChild(badges);
 

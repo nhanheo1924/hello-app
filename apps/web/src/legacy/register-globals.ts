@@ -10,6 +10,7 @@ import * as MembershipApi from '../modules/membership/membership-api';
 import * as TaskFeatureApi from '../modules/task/task-api';
 import * as CalendarApi from '../modules/calendar/calendar-api';
 import { createGovernanceApiCompat } from '../modules/governance/governance-api';
+import { bootstrapAppI18n, type OrbitI18nCompat } from '../core/i18n/app-i18n';
 
 declare global {
   interface Window {
@@ -25,6 +26,7 @@ declare global {
     OrbitTaskFeatureApi: typeof TaskFeatureApi;
     OrbitCalendarApi: typeof CalendarApi;
     OrbitGovernanceApi: ReturnType<typeof createGovernanceApiCompat>;
+    OrbitI18n?: OrbitI18nCompat;
   }
 }
 
@@ -41,4 +43,5 @@ export function registerLegacyGlobals(): void {
   window.OrbitTaskFeatureApi = TaskFeatureApi;
   window.OrbitCalendarApi = CalendarApi;
   window.OrbitGovernanceApi = createGovernanceApiCompat();
+  window.OrbitI18n = bootstrapAppI18n();
 }

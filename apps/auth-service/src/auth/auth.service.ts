@@ -25,13 +25,16 @@ import {
   createCipheriv,
   createDecipheriv,
   createHash,
+  randomInt,
   randomBytes,
   randomUUID,
 } from 'crypto';
 import ms, { type StringValue } from 'ms';
 import { authenticator } from 'otplib';
 import QRCode from 'qrcode';
+import { EmailService } from '../email/email.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { RedisService } from '../redis/redis.service';
 import { UsersService } from '../users/users.service';
 import { DisableTwoFactorDto } from './dto/disable-two-factor.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
@@ -39,6 +42,7 @@ import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 import { VerifyTwoFactorLoginDto } from './dto/verify-two-factor-login.dto';
+import { type EmailOtpType } from './types/email-otp.type';
 import { JwtKeyService } from './jwt-key.service';
 import { AuthResponse, PublicUser } from './interfaces/auth-response.interface';
 import { AuthTokens } from './interfaces/auth-tokens.interface';
@@ -86,32 +90,6 @@ interface AdminAuditLogsQuery {
   to?: string;
 }
 
-type OauthExchangePayload = {
-  accessToken: string;
-  expiresIn: number;
-  session: {
-    sid: string;
-  };
-  user: {
-    id: string;
-    email: string;
-    status: UserStatus;
-    systemRole: SystemRole;
-    firstName: string | null;
-    lastName: string | null;
-    displayName: string | null;
-    dob: string | null;
-    address: string | null;
-    avatarUrl: string | null;
-    timezone: string | null;
-    locale: string | null;
-    fullName: string | null;
-    twoFactorEnabled: boolean;
-    createdAt: string;
-    updatedAt: string;
-  };
-};
-
 type PrismaTx = Prisma.TransactionClient;
 
 const SYSTEM_ADMIN_ROLES = new Set<SystemRole>([
@@ -148,13 +126,21 @@ export interface TwoFactorSetupPayload {
 export class AuthService {
   private readonly accessTokenExpiresIn: StringValue;
   private readonly accessTokenExpiresInSeconds: number;
+  private readonly refreshTokenExpiresIn: StringValue;
+  private readonly refreshTokenExpiresInMs: number;
+  private readonly refreshTokenExpiresInSeconds: number;
   private readonly oauthExchangeCodeExpiresInMs: number;
   private readonly twoFactorChallengeExpiresIn: StringValue;
   private readonly twoFactorIssuer: string;
   private readonly twoFactorEncryptionSecret: string;
+  private readonly internalProxySecret: string;
+  private readonly taskServiceInternalBaseUrl: string;
   private readonly googleOauthClientId: string;
   private readonly googleOauthClientSecret: string;
   private readonly googleOauthRedirectUri: string;
+  private readonly emailOtpTtlSeconds: number;
+  private readonly emailOtpRateLimitSeconds: number;
+  private readonly emailOtpVerificationTtlSeconds: number;
   private readonly failedAuthAttempts = new Map<string, FailedAttempt>();
   private readonly maxFailedAttemptsPerWindow = 8;
   private readonly failedAttemptWindowMs = 5 * 60_000;
@@ -164,6 +150,8 @@ export class AuthService {
     private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
+    private readonly redisService: RedisService,
+    private readonly emailService: EmailService,
     private readonly jwtKeyService: JwtKeyService,
   ) {
     this.accessTokenExpiresIn = this.configService.get<StringValue>(
@@ -184,6 +172,23 @@ export class AuthService {
       });
     }
     this.accessTokenExpiresInSeconds = Math.floor(accessTokenTtlMs / 1000);
+    this.refreshTokenExpiresIn = this.configService.get<StringValue>(
+      'REFRESH_TOKEN_EXPIRES_IN',
+      '3d' as StringValue,
+    );
+    const refreshTokenTtlMs = ms(this.refreshTokenExpiresIn);
+    if (
+      typeof refreshTokenTtlMs !== 'number' ||
+      !Number.isFinite(refreshTokenTtlMs) ||
+      refreshTokenTtlMs <= 0
+    ) {
+      throw new InternalServerErrorException({
+        code: 'CONFIG_INVALID',
+        message: 'Invalid REFRESH_TOKEN_EXPIRES_IN value',
+      });
+    }
+    this.refreshTokenExpiresInMs = refreshTokenTtlMs;
+    this.refreshTokenExpiresInSeconds = Math.floor(refreshTokenTtlMs / 1000);
     const oauthExchangeCodeExpiresIn = this.configService.get<StringValue>(
       'OAUTH_EXCHANGE_CODE_EXPIRES_IN',
       '60s' as StringValue,
@@ -208,14 +213,23 @@ export class AuthService {
       'TOTP_ISSUER',
       'CTM Auth',
     );
+    this.internalProxySecret =
+      this.configService.get<string>('INTERNAL_PROXY_SECRET', '')?.trim() ??
+      '';
+    this.taskServiceInternalBaseUrl = String(
+      this.configService.get<string>(
+        'TASK_SERVICE_INTERNAL_BASE_URL',
+        'http://localhost:3002/api/internal',
+      ),
+    )
+      .trim()
+      .replace(/\/+$/, '');
     const rawTotpEncryptionSecret =
       this.configService.get<string>('TOTP_ENCRYPTION_SECRET')?.trim() ?? '';
-    const fallbackEncryptionSecret =
-      this.configService.get<string>('INTERNAL_PROXY_SECRET', '')?.trim() ?? '';
     this.twoFactorEncryptionSecret =
       rawTotpEncryptionSecret.length >= 32
         ? rawTotpEncryptionSecret
-        : fallbackEncryptionSecret;
+        : this.internalProxySecret;
 
     this.googleOauthClientId =
       this.configService.get<string>('GOOGLE_OAUTH_CLIENT_ID', '') ?? '';
@@ -223,11 +237,229 @@ export class AuthService {
       this.configService.get<string>('GOOGLE_OAUTH_CLIENT_SECRET', '') ?? '';
     this.googleOauthRedirectUri =
       this.configService.get<string>('GOOGLE_OAUTH_REDIRECT_URI', '') ?? '';
+    this.emailOtpTtlSeconds = this.resolvePositiveIntegerConfig(
+      'EMAIL_OTP_TTL_SECONDS',
+      300,
+    );
+    this.emailOtpRateLimitSeconds = this.resolvePositiveIntegerConfig(
+      'EMAIL_OTP_RATE_LIMIT_SECONDS',
+      60,
+    );
+    this.emailOtpVerificationTtlSeconds = this.resolvePositiveIntegerConfig(
+      'EMAIL_OTP_VERIFICATION_TTL_SECONDS',
+      600,
+    );
 
     authenticator.options = {
       step: 30,
       window: 1,
     };
+  }
+
+  async sendEmailOTP(
+    email: string,
+    type: EmailOtpType,
+  ): Promise<{ success: true }> {
+    const normalizedEmail = email.toLowerCase().trim();
+    const rateLimitKey = this.buildEmailOtpRateLimitKey(normalizedEmail);
+    const otpKey = this.buildEmailOtpKey(type, normalizedEmail);
+
+    const acquiredRateLimit = await this.redisService.setIfAbsentWithExpiry(
+      rateLimitKey,
+      '1',
+      this.emailOtpRateLimitSeconds,
+    );
+    if (!acquiredRateLimit) {
+      const retryAfterSeconds =
+        await this.redisService.getRemainingTtlSeconds(rateLimitKey);
+      throw new HttpException(
+        {
+          code: 'OTP_RATE_LIMITED',
+          message: 'Please wait before requesting another one-time code',
+          details: {
+            retryAfterSeconds:
+              retryAfterSeconds > 0
+                ? retryAfterSeconds
+                : this.emailOtpRateLimitSeconds,
+          },
+        },
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+
+    const existingUser = await this.usersService.findByEmail(normalizedEmail);
+    if (type === 'REGISTER' && existingUser) {
+      throw new BadRequestException({
+        code: 'EMAIL_EXISTS',
+        message: 'Email already exists',
+      });
+    }
+    if (type === 'MFA' && (!existingUser || !existingUser.twoFactorEnabled)) {
+      throw new BadRequestException({
+        code: 'MFA_NOT_ENABLED',
+        message: 'Two-factor authentication is not enabled for this account',
+      });
+    }
+    if (type === 'RESET_PASSWORD' && !existingUser) {
+      return { success: true };
+    }
+
+    const otpCode = this.generateEmailOtpCode();
+    await this.redisService.setWithExpiry(
+      otpKey,
+      otpCode,
+      this.emailOtpTtlSeconds,
+    );
+
+    try {
+      await this.emailService.sendOtpEmail({
+        to: normalizedEmail,
+        code: otpCode,
+        type,
+        ttlSeconds: this.emailOtpTtlSeconds,
+      });
+    } catch (error) {
+      await this.redisService.del(otpKey);
+      await this.redisService.del(rateLimitKey);
+      throw error;
+    }
+
+    return { success: true };
+  }
+
+  async verifyEmailOTP(
+    email: string,
+    code: string,
+    type: EmailOtpType,
+  ): Promise<{ success: true; verificationToken: string }> {
+    const normalizedEmail = email.toLowerCase().trim();
+    const normalizedCode = String(code || '').trim();
+
+    if (!/^\d{6}$/.test(normalizedCode)) {
+      throw new BadRequestException({
+        code: 'OTP_INVALID',
+        message: 'Invalid or expired one-time code',
+      });
+    }
+
+    const otpKey = this.buildEmailOtpKey(type, normalizedEmail);
+    const storedCode = await this.redisService.get(otpKey);
+    if (!storedCode || storedCode !== normalizedCode) {
+      throw new BadRequestException({
+        code: 'OTP_INVALID',
+        message: 'Invalid or expired one-time code',
+      });
+    }
+
+    await this.redisService.del(otpKey);
+
+    const verificationToken = randomBytes(32).toString('base64url');
+    const verificationKey = this.buildEmailOtpVerificationKey(
+      type,
+      normalizedEmail,
+      verificationToken,
+    );
+    await this.redisService.setWithExpiry(
+      verificationKey,
+      '1',
+      this.emailOtpVerificationTtlSeconds,
+    );
+
+    return {
+      success: true,
+      verificationToken,
+    };
+  }
+
+  async verifyTOTP(userId: string, code: string): Promise<boolean> {
+    const normalizedCode = String(code || '').trim();
+    if (!/^\d{6}$/.test(normalizedCode)) {
+      return false;
+    }
+
+    const user = await this.usersService.findById(userId);
+    if (!user || !user.twoFactorSecret) {
+      return false;
+    }
+
+    let secret: string;
+    try {
+      secret = this.decryptTwoFactorSecret(user.twoFactorSecret);
+    } catch {
+      return false;
+    }
+
+    return authenticator.check(normalizedCode, secret);
+  }
+
+  async resetPasswordWithOtp(
+    input: {
+      email: string;
+      newPassword: string;
+      otpVerificationToken: string;
+    },
+    sessionContext: SessionContext,
+  ): Promise<{ success: true }> {
+    const normalizedEmail = input.email.toLowerCase().trim();
+    await this.consumeEmailOtpVerificationToken(
+      normalizedEmail,
+      'RESET_PASSWORD',
+      input.otpVerificationToken,
+    );
+
+    const user = await this.usersService.findByEmail(normalizedEmail);
+    if (!user) {
+      throw new BadRequestException({
+        code: 'RESET_PASSWORD_INVALID',
+        message: 'Invalid password reset request',
+      });
+    }
+
+    if (user.passwordHash) {
+      const reusingCurrentPassword = await argon2.verify(
+        user.passwordHash,
+        input.newPassword,
+      );
+      if (reusingCurrentPassword) {
+        throw new BadRequestException({
+          code: 'PASSWORD_REUSE',
+          message: 'New password must be different from current password',
+        });
+      }
+    }
+
+    const nextPasswordHash = await argon2.hash(input.newPassword, {
+      type: argon2.argon2id,
+    });
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.user.update({
+        where: { id: user.id },
+        data: {
+          passwordHash: nextPasswordHash,
+        },
+      });
+
+      await this.revokeActiveSessionsForUser(
+        tx,
+        user.id,
+        SessionRevokeReason.SECURITY,
+        sessionContext,
+      );
+
+      await this.writeAuditLog(tx, {
+        userId: user.id,
+        email: user.email,
+        ip: sessionContext.ip,
+        userAgent: sessionContext.userAgent,
+        action: AuditAction.SECURITY_EVENT,
+        detail: {
+          type: 'PASSWORD_RESET_BY_OTP',
+        },
+      });
+    });
+
+    return { success: true };
   }
 
   async register(
@@ -245,6 +477,12 @@ export class AuthService {
         message: 'Email already exists',
       });
     }
+
+    await this.consumeEmailOtpVerificationToken(
+      normalizedEmail,
+      'REGISTER',
+      dto.otpVerificationToken,
+    );
 
     const passwordHash = await argon2.hash(dto.password, {
       type: argon2.argon2id,
@@ -273,14 +511,12 @@ export class AuthService {
           firstName,
           lastName,
           fullName,
-          displayName: this.buildDisplayName(
-            {
-              firstName,
-              lastName,
-              fullName,
-              email: normalizedEmail,
-            },
-          ),
+          displayName: this.buildDisplayName({
+            firstName,
+            lastName,
+            fullName,
+            email: normalizedEmail,
+          }),
           status: UserStatus.ACTIVE,
         },
       });
@@ -301,12 +537,7 @@ export class AuthService {
     });
     this.clearFailedAuthAttempts(normalizedEmail, sessionContext.ip);
 
-    return {
-      user: this.toPublicUser(created.user),
-      accessToken: created.tokens.accessToken,
-      expiresIn: created.tokens.expiresIn,
-      session: { sid: created.tokens.sessionId },
-    };
+    return this.toAuthSession(created.user, created.tokens);
   }
 
   async login(
@@ -421,12 +652,7 @@ export class AuthService {
       };
     });
 
-    return {
-      user: this.toPublicUser(result.user),
-      accessToken: result.tokens.accessToken,
-      expiresIn: result.tokens.expiresIn,
-      session: { sid: result.tokens.sessionId },
-    };
+    return this.toAuthSession(result.user, result.tokens);
   }
 
   async verifyTwoFactorLogin(
@@ -499,12 +725,182 @@ export class AuthService {
       return { user: updatedUser, tokens };
     });
 
-    return {
-      user: this.toPublicUser(result.user),
-      accessToken: result.tokens.accessToken,
-      expiresIn: result.tokens.expiresIn,
-      session: { sid: result.tokens.sessionId },
-    };
+    return this.toAuthSession(result.user, result.tokens);
+  }
+
+  async refreshSession(
+    rawRefreshToken: string,
+    sessionContext: SessionContext,
+  ): Promise<AuthSession> {
+    const refreshToken = String(rawRefreshToken || '').trim();
+    if (!refreshToken) {
+      throw new UnauthorizedException({
+        code: 'REFRESH_TOKEN_MISSING',
+        message: 'Refresh token is required',
+      });
+    }
+
+    const refreshTokenHash = this.hashRefreshToken(refreshToken);
+    const now = new Date();
+
+    const result = await this.prisma.$transaction(async (tx) => {
+      const tokenRecord = await tx.refreshToken.findFirst({
+        where: {
+          tokenHash: refreshTokenHash,
+        },
+        include: {
+          session: {
+            include: {
+              user: true,
+            },
+          },
+        },
+      });
+
+      if (!tokenRecord) {
+        throw new UnauthorizedException({
+          code: 'REFRESH_INVALID',
+          message: 'Refresh token is invalid',
+        });
+      }
+
+      const session = tokenRecord.session;
+      const user = session.user;
+      if (!session || !user) {
+        throw new UnauthorizedException({
+          code: 'REFRESH_INVALID',
+          message: 'Refresh token is invalid',
+        });
+      }
+
+      if (session.revokedAt) {
+        throw new UnauthorizedException({
+          code: 'SESSION_REVOKED',
+          message: 'Session revoked',
+        });
+      }
+
+      if (user.status !== UserStatus.ACTIVE) {
+        await this.revokeSessionById(tx, session.id, SessionRevokeReason.ADMIN);
+        throw new UnauthorizedException({
+          code: 'SESSION_REVOKED',
+          message: 'Session revoked',
+        });
+      }
+
+      if (tokenRecord.expiresAt <= now) {
+        await tx.refreshToken.updateMany({
+          where: {
+            id: tokenRecord.id,
+            revokedAt: null,
+          },
+          data: {
+            revokedAt: now,
+            lastUsedAt: now,
+          },
+        });
+        throw new UnauthorizedException({
+          code: 'REFRESH_EXPIRED',
+          message: 'Refresh token has expired',
+        });
+      }
+
+      if (tokenRecord.revokedAt || tokenRecord.replacedByTokenId) {
+        await this.revokeSessionById(
+          tx,
+          session.id,
+          SessionRevokeReason.REFRESH_REUSE,
+        );
+        throw new UnauthorizedException({
+          code: 'REFRESH_REUSED',
+          message: 'Refresh token reuse detected',
+        });
+      }
+
+      const nextRefreshToken = this.generateRefreshToken();
+      const nextRefreshTokenHash = this.hashRefreshToken(nextRefreshToken);
+      const nextRefreshTokenId = randomUUID();
+
+      const rotated = await tx.refreshToken.updateMany({
+        where: {
+          id: tokenRecord.id,
+          revokedAt: null,
+          replacedByTokenId: null,
+          expiresAt: {
+            gt: now,
+          },
+        },
+        data: {
+          revokedAt: now,
+          replacedByTokenId: nextRefreshTokenId,
+          lastUsedAt: now,
+        },
+      });
+      if (rotated.count !== 1) {
+        await this.revokeSessionById(
+          tx,
+          session.id,
+          SessionRevokeReason.REFRESH_REUSE,
+        );
+        throw new UnauthorizedException({
+          code: 'REFRESH_REUSED',
+          message: 'Refresh token reuse detected',
+        });
+      }
+
+      await tx.refreshToken.create({
+        data: {
+          id: nextRefreshTokenId,
+          sessionId: session.id,
+          tokenHash: nextRefreshTokenHash,
+          expiresAt: new Date(now.getTime() + this.refreshTokenExpiresInMs),
+          createdByIp: sessionContext.ip,
+          createdByUserAgent: sessionContext.userAgent,
+          lastUsedAt: now,
+        },
+      });
+
+      await tx.session.update({
+        where: { id: session.id },
+        data: {
+          lastSeenAt: now,
+          ip: sessionContext.ip,
+          userAgent: sessionContext.userAgent,
+          deviceId: sessionContext.deviceId ?? session.deviceId,
+        },
+      });
+
+      const nextAccessToken = await this.signAccessToken(
+        user.id,
+        user.email,
+        session.id,
+        user.systemRole,
+      );
+
+      await this.writeAuditLog(tx, {
+        userId: user.id,
+        email: user.email,
+        ip: sessionContext.ip,
+        userAgent: sessionContext.userAgent,
+        action: AuditAction.REFRESH_OK,
+        detail: {
+          sessionId: session.id,
+        },
+      });
+
+      return {
+        user,
+        tokens: {
+          accessToken: nextAccessToken,
+          refreshToken: nextRefreshToken,
+          expiresIn: this.accessTokenExpiresInSeconds,
+          refreshExpiresIn: this.refreshTokenExpiresInSeconds,
+          sessionId: session.id,
+        } as AuthTokens,
+      };
+    });
+
+    return this.toAuthSession(result.user, result.tokens);
   }
 
   async beginTwoFactorSetup(userId: string): Promise<TwoFactorSetupPayload> {
@@ -731,7 +1127,9 @@ export class AuthService {
     }
     if (dto.locale !== undefined) {
       const normalizedLocale = this.normalizeNullableText(dto.locale, 16);
-      updateData.locale = normalizedLocale ? normalizedLocale.toLowerCase() : null;
+      updateData.locale = normalizedLocale
+        ? normalizedLocale.toLowerCase()
+        : null;
     }
 
     if (
@@ -740,18 +1138,16 @@ export class AuthService {
         dto.firstName !== undefined ||
         dto.lastName !== undefined)
     ) {
-      updateData.displayName = this.buildDisplayName(
-        {
-          firstName: nextFirstName,
-          lastName: nextLastName,
-          fullName:
-            dto.fullName !== undefined
-              ? normalizedFullNameInput ?? null
-              : existing.fullName,
-          email: existing.email,
-          fallbackDisplayName: existing.displayName,
-        },
-      );
+      updateData.displayName = this.buildDisplayName({
+        firstName: nextFirstName,
+        lastName: nextLastName,
+        fullName:
+          dto.fullName !== undefined
+            ? (normalizedFullNameInput ?? null)
+            : existing.fullName,
+        email: existing.email,
+        fallbackDisplayName: existing.displayName,
+      });
     }
 
     if (Object.keys(updateData).length === 0) {
@@ -1276,6 +1672,114 @@ export class AuthService {
     };
   }
 
+  async deleteAdminUser(
+    actorUserId: string,
+    targetUserId: string,
+    sessionContext: SessionContext,
+  ): Promise<{ data: { id: string; deleted: true } }> {
+    const actor = await this.requireSystemAdmin(actorUserId);
+    if (actor.id === targetUserId) {
+      throw new BadRequestException({
+        code: 'INVALID_OPERATION',
+        message: 'Cannot delete your own account',
+      });
+    }
+
+    const target = await this.usersService.findById(targetUserId);
+    if (!target) {
+      throw new NotFoundException({
+        code: 'USER_NOT_FOUND',
+        message: 'User not found',
+      });
+    }
+
+    if (
+      actor.systemRole !== SystemRole.SUPER_ADMIN &&
+      target.systemRole === SystemRole.SUPER_ADMIN
+    ) {
+      throw new ForbiddenException({
+        code: 'AUTH_FORBIDDEN',
+        message: 'Only SUPER_ADMIN can delete SUPER_ADMIN account',
+      });
+    }
+
+    if (target.systemRole === SystemRole.SUPER_ADMIN) {
+      const superAdminCount = await this.prisma.user.count({
+        where: {
+          systemRole: SystemRole.SUPER_ADMIN,
+        },
+      });
+      if (superAdminCount <= 1) {
+        throw new BadRequestException({
+          code: 'LAST_SUPER_ADMIN',
+          message: 'Cannot delete the last SUPER_ADMIN account',
+        });
+      }
+    }
+
+    const ownerWorkspaceCount =
+      await this.getTaskServiceOwnerWorkspaceCount(targetUserId);
+    if (ownerWorkspaceCount > 0) {
+      throw new ConflictException({
+        code: 'USER_OWNS_WORKSPACES',
+        message:
+          'Cannot delete this user while they still own one or more workspaces',
+        details: {
+          ownerWorkspaceCount,
+        },
+      });
+    }
+
+    await this.cleanupTaskServiceUserData(targetUserId);
+
+    await this.prisma.$transaction(async (tx) => {
+      const now = new Date();
+      await tx.refreshToken.updateMany({
+        where: {
+          session: {
+            userId: targetUserId,
+          },
+          revokedAt: null,
+        },
+        data: {
+          revokedAt: now,
+        },
+      });
+      await tx.session.updateMany({
+        where: {
+          userId: targetUserId,
+          revokedAt: null,
+        },
+        data: {
+          revokedAt: now,
+          revokeReason: SessionRevokeReason.ADMIN,
+        },
+      });
+      await tx.user.delete({
+        where: { id: targetUserId },
+      });
+      await this.writeAuditLog(tx, {
+        userId: actor.id,
+        email: actor.email,
+        ip: sessionContext.ip,
+        userAgent: sessionContext.userAgent,
+        action: AuditAction.SECURITY_EVENT,
+        detail: {
+          event: 'ADMIN_USER_DELETED',
+          targetUserId,
+          targetEmail: target.email,
+        },
+      });
+    });
+
+    return {
+      data: {
+        id: targetUserId,
+        deleted: true,
+      },
+    };
+  }
+
   async listAdminUserSessions(
     actorUserId: string,
     targetUserId: string,
@@ -1452,7 +1956,7 @@ export class AuthService {
         ip: row.ip,
         userAgent: row.userAgent,
         action: row.action,
-        detail: row.detail as Prisma.JsonValue | null,
+        detail: row.detail,
         createdAt: row.createdAt,
       })),
       meta: {
@@ -1654,19 +2158,16 @@ export class AuthService {
       };
     });
 
-    return {
-      user: this.toPublicUser(result.user),
-      accessToken: result.tokens.accessToken,
-      expiresIn: result.tokens.expiresIn,
-      session: { sid: result.tokens.sessionId },
-    };
+    return this.toAuthSession(result.user, result.tokens);
   }
 
   async createOauthExchangeCode(session: AuthSession): Promise<string> {
     const code = this.generateOauthExchangeCode();
     const codeHash = this.hashOauthExchangeCode(code);
     const now = new Date();
-    const expiresAt = new Date(now.getTime() + this.oauthExchangeCodeExpiresInMs);
+    const expiresAt = new Date(
+      now.getTime() + this.oauthExchangeCodeExpiresInMs,
+    );
 
     await this.prisma.oauthExchangeCode.create({
       data: {
@@ -1693,7 +2194,9 @@ export class AuthService {
         where: { codeHash },
       });
       if (!row || row.expiresAt <= now || row.consumedAt) {
-        throw new UnauthorizedException('OAuth exchange code is invalid or expired');
+        throw new UnauthorizedException(
+          'OAuth exchange code is invalid or expired',
+        );
       }
 
       const consumed = await tx.oauthExchangeCode.updateMany({
@@ -1710,13 +2213,15 @@ export class AuthService {
       });
 
       if (consumed.count !== 1) {
-        throw new UnauthorizedException('OAuth exchange code is invalid or expired');
+        throw new UnauthorizedException(
+          'OAuth exchange code is invalid or expired',
+        );
       }
 
       return row.payloadJson;
     });
 
-    return this.deserializeOauthExchangePayload(payload as Prisma.JsonValue);
+    return this.deserializeOauthExchangePayload(payload);
   }
 
   private async issueTokens(
@@ -1726,6 +2231,9 @@ export class AuthService {
   ): Promise<AuthTokens> {
     const now = new Date();
     const sessionId = randomUUID();
+    const refreshToken = this.generateRefreshToken();
+    const refreshTokenId = randomUUID();
+    const refreshTokenHash = this.hashRefreshToken(refreshToken);
     const accessToken = await this.signAccessToken(
       user.id,
       user.email,
@@ -1743,10 +2251,23 @@ export class AuthService {
         lastSeenAt: now,
       },
     });
+    await tx.refreshToken.create({
+      data: {
+        id: refreshTokenId,
+        sessionId,
+        tokenHash: refreshTokenHash,
+        expiresAt: new Date(now.getTime() + this.refreshTokenExpiresInMs),
+        createdByIp: sessionContext.ip,
+        createdByUserAgent: sessionContext.userAgent,
+        lastUsedAt: now,
+      },
+    });
 
     return {
       accessToken,
+      refreshToken,
       expiresIn: this.accessTokenExpiresInSeconds,
+      refreshExpiresIn: this.refreshTokenExpiresInSeconds,
       sessionId,
     };
   }
@@ -1962,8 +2483,27 @@ export class AuthService {
     };
   }
 
+  private toAuthSession(user: User, tokens: AuthTokens): AuthSession {
+    return {
+      user: this.toPublicUser(user),
+      accessToken: tokens.accessToken,
+      refreshToken: tokens.refreshToken,
+      expiresIn: tokens.expiresIn,
+      refreshExpiresIn: tokens.refreshExpiresIn,
+      session: { sid: tokens.sessionId },
+    };
+  }
+
   private generateOauthExchangeCode(): string {
     return randomBytes(32).toString('base64url');
+  }
+
+  private generateRefreshToken(): string {
+    return randomBytes(48).toString('base64url');
+  }
+
+  private hashRefreshToken(token: string): string {
+    return createHash('sha256').update(String(token || '')).digest('hex');
   }
 
   private hashOauthExchangeCode(code: string): string {
@@ -1975,7 +2515,9 @@ export class AuthService {
   ): Prisma.InputJsonValue {
     return {
       accessToken: session.accessToken,
+      refreshToken: session.refreshToken,
       expiresIn: session.expiresIn,
+      refreshExpiresIn: session.refreshExpiresIn,
       session: {
         sid: session.session.sid,
       },
@@ -2000,7 +2542,9 @@ export class AuthService {
     };
   }
 
-  private deserializeOauthExchangePayload(payload: Prisma.JsonValue): AuthSession {
+  private deserializeOauthExchangePayload(
+    payload: Prisma.JsonValue,
+  ): AuthSession {
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
       throw new UnauthorizedException('OAuth exchange payload is invalid');
     }
@@ -2008,18 +2552,29 @@ export class AuthService {
     const record = payload as Record<string, unknown>;
     const accessToken =
       typeof record.accessToken === 'string' ? record.accessToken.trim() : '';
+    const refreshToken =
+      typeof record.refreshToken === 'string'
+        ? record.refreshToken.trim()
+        : '';
     const expiresIn = Number(record.expiresIn);
+    const refreshExpiresIn = Number(record.refreshExpiresIn);
     const sessionRecord =
-      record.session && typeof record.session === 'object' && !Array.isArray(record.session)
+      record.session &&
+      typeof record.session === 'object' &&
+      !Array.isArray(record.session)
         ? (record.session as Record<string, unknown>)
         : {};
-    const sid = typeof sessionRecord.sid === 'string' ? sessionRecord.sid.trim() : '';
+    const sid =
+      typeof sessionRecord.sid === 'string' ? sessionRecord.sid.trim() : '';
     const user = this.deserializePublicUserFromOauthPayload(record.user);
 
     if (
       !accessToken ||
+      !refreshToken ||
       !Number.isFinite(expiresIn) ||
       expiresIn <= 0 ||
+      !Number.isFinite(refreshExpiresIn) ||
+      refreshExpiresIn <= 0 ||
       !sid ||
       !user
     ) {
@@ -2028,13 +2583,17 @@ export class AuthService {
 
     return {
       accessToken,
+      refreshToken,
       expiresIn: Math.floor(expiresIn),
+      refreshExpiresIn: Math.floor(refreshExpiresIn),
       session: { sid },
       user,
     };
   }
 
-  private deserializePublicUserFromOauthPayload(input: unknown): PublicUser | null {
+  private deserializePublicUserFromOauthPayload(
+    input: unknown,
+  ): PublicUser | null {
     if (!input || typeof input !== 'object' || Array.isArray(input)) {
       return null;
     }
@@ -2101,7 +2660,7 @@ export class AuthService {
   }
 
   private toUserStatus(value: unknown): UserStatus | null {
-    const normalized = String(value || '').trim().toUpperCase();
+    const normalized = this.normalizeEnumValue(value);
     if (
       normalized === UserStatus.ACTIVE ||
       normalized === UserStatus.LOCKED ||
@@ -2113,7 +2672,7 @@ export class AuthService {
   }
 
   private toSystemRole(value: unknown): SystemRole | null {
-    const normalized = String(value || '').trim().toUpperCase();
+    const normalized = this.normalizeEnumValue(value);
     if (
       normalized === SystemRole.SUPER_ADMIN ||
       normalized === SystemRole.SYSTEM_ADMIN ||
@@ -2124,6 +2683,18 @@ export class AuthService {
     return null;
   }
 
+  private normalizeEnumValue(value: unknown): string {
+    if (
+      typeof value === 'string' ||
+      typeof value === 'number' ||
+      typeof value === 'boolean'
+    ) {
+      return String(value).trim().toUpperCase();
+    }
+
+    return '';
+  }
+
   private buildDisplayName(input: {
     firstName?: string | null;
     lastName?: string | null;
@@ -2131,7 +2702,10 @@ export class AuthService {
     email: string;
     fallbackDisplayName?: string | null;
   }): string {
-    const normalizedFirstName = this.normalizeNullableText(input.firstName, 120);
+    const normalizedFirstName = this.normalizeNullableText(
+      input.firstName,
+      120,
+    );
     const normalizedLastName = this.normalizeNullableText(input.lastName, 120);
     const normalizedFullName = this.normalizeNullableText(input.fullName, 120);
     const normalizedFallbackDisplayName = this.normalizeNullableText(
@@ -2159,7 +2733,9 @@ export class AuthService {
       return normalizedFallbackDisplayName;
     }
 
-    const localPart = String(input.email || '').split('@')[0].trim();
+    const localPart = String(input.email || '')
+      .split('@')[0]
+      .trim();
     if (localPart) {
       return localPart.slice(0, 120);
     }
@@ -2183,11 +2759,69 @@ export class AuthService {
     return trimmed.slice(0, maxLength);
   }
 
-  private verifyTotpCode(secret: string, otp: string): boolean {
-    return authenticator.verify({
-      token: otp.trim(),
-      secret,
+  private resolvePositiveIntegerConfig(
+    key: string,
+    fallbackValue: number,
+  ): number {
+    const value = Number(this.configService.get<number | string>(key));
+    if (Number.isFinite(value) && value > 0) {
+      return Math.floor(value);
+    }
+
+    return fallbackValue;
+  }
+
+  private generateEmailOtpCode(): string {
+    return String(randomInt(100000, 1_000_000));
+  }
+
+  private buildEmailOtpKey(type: EmailOtpType, email: string): string {
+    return `otp:${type}:${email.toLowerCase().trim()}`;
+  }
+
+  private buildEmailOtpRateLimitKey(email: string): string {
+    return `limit:${email.toLowerCase().trim()}`;
+  }
+
+  private buildEmailOtpVerificationKey(
+    type: EmailOtpType,
+    email: string,
+    verificationToken: string,
+  ): string {
+    return `otpv:${type}:${email.toLowerCase().trim()}:${verificationToken.trim()}`;
+  }
+
+  private async consumeEmailOtpVerificationToken(
+    email: string,
+    type: EmailOtpType,
+    verificationToken: string,
+  ): Promise<void> {
+    const normalizedToken = String(verificationToken || '').trim();
+    if (!normalizedToken) {
+      throw new BadRequestException({
+        code: 'OTP_VERIFICATION_REQUIRED',
+        message: 'Email verification is required',
+      });
+    }
+
+    const verificationKey = this.buildEmailOtpVerificationKey(
+      type,
+      email,
+      normalizedToken,
+    );
+    const consumed = await this.redisService.del(verificationKey);
+    if (consumed > 0) {
+      return;
+    }
+
+    throw new BadRequestException({
+      code: 'OTP_VERIFICATION_INVALID',
+      message: 'Email verification has expired. Please verify again',
     });
+  }
+
+  private verifyTotpCode(secret: string, otp: string): boolean {
+    return authenticator.check(otp.trim(), secret);
   }
 
   private generateBackupCodes(): string[] {
@@ -2306,10 +2940,20 @@ export class AuthService {
     const key = this.buildAuthAttemptKey(email, requestIp);
     const attempt = this.failedAuthAttempts.get(key);
     if (attempt && attempt.count >= this.maxFailedAttemptsPerWindow) {
+      const retryAfterSeconds = Math.max(
+        1,
+        Math.ceil(
+          (attempt.windowStartedAt + this.failedAttemptWindowMs - Date.now()) /
+            1000,
+        ),
+      );
       throw new HttpException(
         {
           code: 'RATE_LIMITED',
           message: 'Too many attempts. Please try again later.',
+          details: {
+            retryAfterSeconds,
+          },
         },
         HttpStatus.TOO_MANY_REQUESTS,
       );
@@ -2386,7 +3030,10 @@ export class AuthService {
     };
   }
 
-  private parseDateInput(value: string | undefined, fieldName: string): Date | null {
+  private parseDateInput(
+    value: string | undefined,
+    fieldName: string,
+  ): Date | null {
     if (!value) {
       return null;
     }
@@ -2398,6 +3045,119 @@ export class AuthService {
       });
     }
     return parsed;
+  }
+
+  private async getTaskServiceOwnerWorkspaceCount(
+    userId: string,
+  ): Promise<number> {
+    const payload = await this.requestTaskServiceInternal(
+      `/admin/users/${encodeURIComponent(userId)}/workspace-ownership`,
+      'GET',
+    );
+    const data =
+      payload.data && typeof payload.data === 'object'
+        ? (payload.data as Record<string, unknown>)
+        : {};
+    const count = Number(data.ownerWorkspaceCount);
+    return Number.isFinite(count) && count >= 0 ? Math.floor(count) : 0;
+  }
+
+  private async cleanupTaskServiceUserData(userId: string): Promise<void> {
+    await this.requestTaskServiceInternal(
+      `/admin/users/${encodeURIComponent(userId)}/cleanup`,
+      'POST',
+    );
+  }
+
+  private async requestTaskServiceInternal(
+    path: string,
+    method: 'GET' | 'POST',
+  ): Promise<Record<string, unknown>> {
+    if (!this.taskServiceInternalBaseUrl || !this.internalProxySecret) {
+      throw new ServiceUnavailableException({
+        code: 'TASK_SERVICE_UNAVAILABLE',
+        message: 'Task service integration is not configured',
+      });
+    }
+
+    const url = `${this.taskServiceInternalBaseUrl}${path}`;
+    let response: globalThis.Response;
+    try {
+      response = await fetch(url, {
+        method,
+        headers: {
+          'x-proxy-secret': this.internalProxySecret,
+          'content-type': 'application/json',
+        },
+      });
+    } catch (error) {
+      throw new ServiceUnavailableException({
+        code: 'TASK_SERVICE_UNAVAILABLE',
+        message: 'Task service is unavailable',
+        details: {
+          reason: error instanceof Error ? error.message : 'UNKNOWN',
+        },
+      });
+    }
+
+    const payload = await this.readJsonRecord(response);
+    if (!response.ok) {
+      const code =
+        typeof payload.code === 'string'
+          ? payload.code
+          : 'TASK_SERVICE_UNAVAILABLE';
+      const message =
+        typeof payload.message === 'string'
+          ? payload.message
+          : 'Task service request failed';
+      const details =
+        payload.details && typeof payload.details === 'object'
+          ? payload.details
+          : null;
+
+      if (response.status === 400) {
+        throw new BadRequestException({ code, message, details });
+      }
+      if (response.status === 404) {
+        throw new NotFoundException({ code, message, details });
+      }
+      if (response.status === 409) {
+        throw new ConflictException({ code, message, details });
+      }
+      if (response.status === 403) {
+        throw new ForbiddenException({ code, message, details });
+      }
+
+      throw new ServiceUnavailableException({
+        code: 'TASK_SERVICE_UNAVAILABLE',
+        message,
+        details: {
+          upstreamStatus: response.status,
+          upstreamCode: code,
+        },
+      });
+    }
+
+    return payload;
+  }
+
+  private async readJsonRecord(
+    response: globalThis.Response,
+  ): Promise<Record<string, unknown>> {
+    const contentType = String(response.headers.get('content-type') || '');
+    if (!contentType.toLowerCase().includes('application/json')) {
+      return {};
+    }
+
+    try {
+      const parsed = (await response.json()) as unknown;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+      return {};
+    } catch {
+      return {};
+    }
   }
 
   private buildAuthAttemptKey(email: string, requestIp: string): string {

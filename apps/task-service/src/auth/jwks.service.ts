@@ -37,6 +37,8 @@ export class JwksService {
   }
 
   private normalizeIssuer(value: string): string {
-    return String(value || "").trim().replace(/\/+$/, "");
+    return String(value || "")
+      .trim()
+      .replace(/\/+$/, "");
   }
 }

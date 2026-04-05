@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Hello - Admin</title>
+  <title>System Admin Dashboard</title>
   <link rel="stylesheet" href="../src/pages/admin/admin.css" />
 </head>
 <body>
@@ -11,7 +11,7 @@
     <header class="admin-head">
       <div>
         <p class="admin-kicker">SYSTEM GOVERNANCE</p>
-        <h1>Admin Console</h1>
+        <h1>System Admin Dashboard</h1>
       </div>
       <div class="admin-head-actions">
         <span class="realtime-chip" id="realtimeStatus" data-status="offline">Realtime: Offline</span>
@@ -27,7 +27,7 @@
       </div>
     </section>
 
-    <section class="card">
+    <section class="card" id="realtimeEventsCard" hidden>
       <div class="card-head">
         <h2>Realtime Events</h2>
         <p class="muted">Latest updates from server</p>
@@ -74,6 +74,9 @@
           </tbody>
         </table>
       </div>
+      <div class="card-foot">
+        <button class="btn ghost" id="loadMoreUsersBtn" type="button">Load more users</button>
+      </div>
     </section>
 
     <section class="card">
@@ -101,6 +104,22 @@
             <tr><td colspan="6">Loading...</td></tr>
           </tbody>
         </table>
+      </div>
+      <div class="card-foot">
+        <button class="btn ghost" id="loadMoreAuditBtn" type="button">Load more logs</button>
+      </div>
+    </section>
+
+    <section class="card" id="workspaceManagementCard" hidden>
+      <div class="card-head">
+        <h2>Workspace Management</h2>
+        <p class="muted">All workspaces in the system</p>
+      </div>
+      <div class="workspace-grid" id="workspaceGrid">
+        <article class="workspace-card muted">Loading workspaces...</article>
+      </div>
+      <div class="card-foot">
+        <button class="btn ghost" id="loadMoreWorkspacesBtn" type="button">Load more workspaces</button>
       </div>
     </section>
 
