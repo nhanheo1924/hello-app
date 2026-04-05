@@ -1,10 +1,11 @@
-import { Injectable } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
-import { Request, Response } from 'express';
-import { GatewayErrorDto } from './dto/gateway-error.dto';
-import { SyncService } from '../sync/sync.service';
+import { Injectable, Logger } from "@nestjs/common";
+import { ConfigService } from "@nestjs/config";
+import { Request, Response } from "express";
+import { randomUUID } from "crypto";
+import { GatewayErrorDto } from "./dto/gateway-error.dto";
+import { SyncService } from "../sync/sync.service";
 
-type UpstreamType = 'auth' | 'task';
+type UpstreamType = "auth" | "task";
 
 type ForwardOptions = {
   upstream: UpstreamType;
@@ -21,49 +22,93 @@ type MutateAuthPayloadResult = {
   buffer: Buffer<ArrayBuffer>;
 };
 
+type TaskDeltaOperation = "create" | "update" | "move" | "delete";
+
+type ResolvedTaskDelta = {
+  operation: TaskDeltaOperation;
+  taskId: string;
+  projectId?: string;
+  taskPatch?: Record<string, unknown> | null;
+};
+
+function parseJsonRecord(raw: string): Record<string, unknown> | null {
+  const parsed: unknown = JSON.parse(raw);
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    ? (parsed as Record<string, unknown>)
+    : null;
+}
+
 const HOP_BY_HOP_HEADERS = new Set([
-  'connection',
-  'content-encoding',
-  'content-length',
-  'keep-alive',
-  'proxy-authenticate',
-  'proxy-authorization',
-  'te',
-  'trailer',
-  'transfer-encoding',
-  'upgrade',
+  "connection",
+  "content-encoding",
+  "content-length",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+]);
+
+const REQUEST_BLOCKED_HEADERS = new Set([
+  ...HOP_BY_HOP_HEADERS,
+  "content-length",
+  "expect",
+  "host",
 ]);
 
 const RETRYABLE_ERROR_CODES = new Set([
-  'ECONNREFUSED',
-  'ECONNRESET',
-  'EHOSTUNREACH',
-  'ENETUNREACH',
-  'ENOTFOUND',
-  'ETIMEDOUT',
-  'EAI_AGAIN',
-  'UND_ERR_CONNECT_TIMEOUT',
-  'UND_ERR_SOCKET',
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  "ETIMEDOUT",
+  "EAI_AGAIN",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_SOCKET",
 ]);
 
-const ADMIN_USER_KEY = 'admin:*';
+const ADMIN_USER_KEY = "admin:*";
 const AUTH_CRITICAL_PATHS = new Set([
-  'login',
-  'signup',
-  'register',
-  '2fa/verify-login',
-  'password',
+  "login",
+  "signup",
+  "register",
+  "2fa/verify-login",
+  "password",
 ]);
 const AUTH_SESSION_ISSUE_PATHS = new Set([
-  'login',
-  'signup',
-  'register',
-  '2fa/verify-login',
-  'oauth/exchange',
+  "login",
+  "signup",
+  "register",
+  "2fa/verify-login",
+  "oauth/exchange",
+  "refresh",
+]);
+const TASK_OBSERVED_PATH_PREFIXES = [
+  "workspaces",
+  "projects",
+  "tasks",
+  "notifications/stream",
+] as const;
+const AUTH_ADMIN_PATH_PREFIX = "admin/";
+const AUTH_REALTIME_PATHS = new Set([
+  "login",
+  "logout",
+  "signup",
+  "register",
+  "2fa/verify-login",
+  "password",
+  "2fa/setup",
+  "2fa/confirm",
+  "2fa/disable",
 ]);
 
 @Injectable()
 export class ProxyService {
+  private readonly logger = new Logger(ProxyService.name);
+
   constructor(
     private readonly configService: ConfigService,
     private readonly syncService: SyncService,
@@ -83,11 +128,12 @@ export class ProxyService {
       options.upstreamPath,
       request,
     );
-    const policy = this.resolveForwardPolicy(
+    const policy = this.resolveForwardPolicy(options, normalizedUpstreamPath);
+    const isSseRequest = this.isSseForwardRequest(request, options);
+    const shouldLogTaskForward = this.shouldLogTaskForward(
       options,
       normalizedUpstreamPath,
     );
-    const isSseRequest = this.isSseForwardRequest(request, options);
 
     const requestBody = this.buildRequestBody(request);
     const headers = this.buildForwardHeaders(request, options);
@@ -107,7 +153,7 @@ export class ProxyService {
           method: request.method,
           headers,
           body: requestBody,
-          redirect: 'manual',
+          redirect: "manual",
           signal: controller.signal,
         });
         break;
@@ -129,18 +175,34 @@ export class ProxyService {
 
     if (!upstreamResponse) {
       const isTimeout =
-        lastError instanceof Error && lastError.name === 'AbortError';
+        lastError instanceof Error && lastError.name === "AbortError";
+      this.logForwardFailure({
+        error: lastError,
+        isTimeout,
+        upstream: options.upstream,
+        upstreamPath: options.upstreamPath,
+        requestId: request.requestId,
+      });
       const status = isTimeout ? 504 : 502;
       const payload: GatewayErrorDto = {
-        code: isTimeout ? 'GATEWAY_TIMEOUT' : 'BAD_GATEWAY',
+        code: isTimeout ? "GATEWAY_TIMEOUT" : "BAD_GATEWAY",
         message: isTimeout
-          ? 'Upstream request timed out'
-          : 'Upstream request failed',
+          ? "Upstream request timed out"
+          : "Upstream request failed",
         details: {
           upstream: options.upstream,
           requestId: request.requestId,
         },
       };
+      if (shouldLogTaskForward) {
+        this.logTaskForwardResult({
+          request,
+          upstreamPath: normalizedUpstreamPath,
+          upstreamStatus: status,
+          upstreamCode: payload.code,
+          upstreamMessage: payload.message,
+        });
+      }
 
       response.status(status).json(payload);
       return;
@@ -148,13 +210,27 @@ export class ProxyService {
 
     response.status(upstreamResponse.status);
     this.copyUpstreamHeaders(upstreamResponse, response);
+    const upstreamRequestId = String(
+      upstreamResponse.headers.get("x-request-id") || "",
+    ).trim();
+    if (
+      shouldLogTaskForward &&
+      (isSseRequest || this.isSseResponse(upstreamResponse))
+    ) {
+      this.logTaskForwardResult({
+        request,
+        upstreamPath: normalizedUpstreamPath,
+        upstreamStatus: upstreamResponse.status,
+        upstreamRequestId,
+      });
+    }
     if (isSseRequest || this.isSseResponse(upstreamResponse)) {
       await this.pipeEventStream(upstreamResponse, response);
       return;
     }
 
     let buffer = Buffer.from(await upstreamResponse.arrayBuffer());
-    if (options.upstream === 'auth') {
+    if (options.upstream === "auth") {
       const handled = this.mutateAuthPayloadAndCookie({
         request,
         response,
@@ -164,49 +240,66 @@ export class ProxyService {
       });
       buffer = handled.buffer;
     }
-
-    if (this.shouldPublishInvalidate(request, options, upstreamResponse.status)) {
-      const workspaceId = this.resolveWorkspaceIdHint(
+    const parsedUpstreamPayload = this.tryParseJsonBody(
+      upstreamResponse,
+      buffer,
+    );
+    if (shouldLogTaskForward) {
+      const { code: upstreamCode, message: upstreamMessage } =
+        this.extractUpstreamCodeAndMessage(parsedUpstreamPayload);
+      this.logTaskForwardResult({
         request,
-        options.upstreamPath,
-        upstreamResponse,
-        buffer,
-      );
-
-      this.syncService.publishInvalidateFromRequest(request, {
-        workspaceId,
-        resource: 'tasks',
+        upstreamPath: normalizedUpstreamPath,
+        upstreamStatus: upstreamResponse.status,
+        upstreamCode,
+        upstreamMessage,
+        upstreamRequestId,
       });
     }
 
-    if (this.shouldPublishAdminInvalidate(request, options, upstreamResponse.status)) {
-      this.syncService.publishInvalidate({
-        userKey: ADMIN_USER_KEY,
-        workspaceId: '*',
-        resource: this.resolveAdminInvalidateResource(options),
-      });
-    }
+    const workspaceId = this.resolveWorkspaceIdHint(
+      request,
+      options.upstreamPath,
+      upstreamResponse,
+      buffer,
+    );
+
+    await this.publishRealtimeUpdates({
+      request,
+      options,
+      normalizedUpstreamPath,
+      upstreamStatus: upstreamResponse.status,
+      workspaceId,
+      parsedUpstreamPayload,
+    });
 
     response.end(buffer);
   }
 
-  private isSseForwardRequest(request: Request, options: ForwardOptions): boolean {
-    if (options.upstream !== 'task') {
+  private isSseForwardRequest(
+    request: Request,
+    options: ForwardOptions,
+  ): boolean {
+    if (options.upstream !== "task") {
       return false;
     }
 
-    const path = String(options.upstreamPath || '').replace(/^\/+/, '');
-    if (!path.startsWith('notifications/stream')) {
+    const path = String(options.upstreamPath || "").replace(/^\/+/, "");
+    if (!path.startsWith("notifications/stream")) {
       return false;
     }
 
-    const acceptHeader = String(request.headers.accept || '').toLowerCase();
-    return acceptHeader.includes('text/event-stream') || request.method === 'GET';
+    const acceptHeader = String(request.headers.accept || "").toLowerCase();
+    return (
+      acceptHeader.includes("text/event-stream") || request.method === "GET"
+    );
   }
 
   private isSseResponse(response: globalThis.Response): boolean {
-    const contentType = String(response.headers.get('content-type') || '').toLowerCase();
-    return contentType.includes('text/event-stream');
+    const contentType = String(
+      response.headers.get("content-type") || "",
+    ).toLowerCase();
+    return contentType.includes("text/event-stream");
   }
 
   private async pipeEventStream(
@@ -220,7 +313,7 @@ export class ProxyService {
     }
 
     const reader = body.getReader();
-    response.on('close', () => {
+    response.on("close", () => {
       void reader.cancel().catch(() => undefined);
     });
 
@@ -239,18 +332,425 @@ export class ProxyService {
     }
   }
 
+  private async publishRealtimeUpdates(input: {
+    request: Request;
+    options: ForwardOptions;
+    normalizedUpstreamPath: string;
+    upstreamStatus: number;
+    workspaceId?: string;
+    parsedUpstreamPayload: Record<string, unknown> | null;
+  }): Promise<void> {
+    const {
+      request,
+      options,
+      normalizedUpstreamPath,
+      upstreamStatus,
+      workspaceId,
+      parsedUpstreamPayload,
+    } = input;
+
+    const taskDelta = this.resolveTaskDelta({
+      method: request.method,
+      normalizedUpstreamPath,
+      upstreamStatus,
+      payload: parsedUpstreamPayload,
+    });
+    const shouldPublishTaskInvalidate =
+      this.shouldPublishInvalidate(request, options, upstreamStatus) &&
+      this.isTaskMutationPath(request.method, normalizedUpstreamPath);
+    const resolvedWorkspaceId =
+      workspaceId ||
+      (taskDelta?.projectId
+        ? await this.fetchWorkspaceIdFromProject(request, taskDelta.projectId)
+        : undefined);
+
+    if (shouldPublishTaskInvalidate) {
+      this.syncService.publishInvalidateFromRequest(request, {
+        workspaceId: resolvedWorkspaceId,
+        resource: "tasks",
+      });
+    }
+
+    let workspaceUserKeys: string[] = [];
+    if (shouldPublishTaskInvalidate && resolvedWorkspaceId) {
+      workspaceUserKeys = await this.fetchWorkspaceMemberUserKeys(
+        request,
+        resolvedWorkspaceId,
+      );
+      if (workspaceUserKeys.length > 0) {
+        this.syncService.publishInvalidateMany({
+          userKeys: workspaceUserKeys,
+          workspaceId: resolvedWorkspaceId,
+          resource: "tasks",
+        });
+      }
+    }
+
+    if (taskDelta && workspaceUserKeys.length > 0) {
+      this.syncService.publishWorkspaceTaskDelta({
+        userKeys: workspaceUserKeys,
+        workspaceId: resolvedWorkspaceId,
+        projectId: taskDelta.projectId,
+        taskId: taskDelta.taskId,
+        operation: taskDelta.operation,
+        taskPatch: taskDelta.taskPatch ?? null,
+        occurredAt: Date.now(),
+      });
+    }
+
+    const shouldPublishAdminInvalidate = this.shouldPublishAdminInvalidate(
+      request,
+      options,
+      upstreamStatus,
+    );
+    if (shouldPublishAdminInvalidate) {
+      const resource = this.resolveAdminInvalidateResource({
+        options,
+        normalizedUpstreamPath,
+        taskDelta,
+      });
+      const operation = this.resolveAdminOperationFromHttpMethod(request.method);
+      const payload = this.resolveAdminDeltaPayload(
+        parsedUpstreamPayload,
+        normalizedUpstreamPath,
+        resolvedWorkspaceId,
+      );
+
+      this.syncService.publishInvalidate({
+        userKey: ADMIN_USER_KEY,
+        workspaceId: "*",
+        resource,
+      });
+      this.syncService.publishAdminDelta({
+        resource,
+        operation,
+        payload,
+      });
+    }
+
+    const adminEvent = this.resolveAdminRealtimeEvent({
+      request,
+      options,
+      normalizedUpstreamPath,
+      upstreamStatus,
+      payload: parsedUpstreamPayload,
+      workspaceId: resolvedWorkspaceId,
+      taskDelta,
+    });
+    if (adminEvent) {
+      this.syncService.publishAdminEvent(adminEvent);
+    }
+  }
+
+  private async fetchWorkspaceMemberUserKeys(
+    request: Request,
+    workspaceId: string,
+  ): Promise<string[]> {
+    const normalizedWorkspaceId = this.normalizeWorkspaceId(workspaceId);
+    if (!normalizedWorkspaceId) {
+      return [];
+    }
+
+    const taskBaseUrl = this.resolveTargetBaseUrl("task");
+    const membersUrl = `${taskBaseUrl}/workspaces/${encodeURIComponent(normalizedWorkspaceId)}/members`;
+    const headers = this.buildForwardHeaders(request, {
+      upstream: "task",
+      upstreamPath: `workspaces/${normalizedWorkspaceId}/members`,
+    });
+
+    try {
+      const response = await fetch(membersUrl, {
+        method: "GET",
+        headers,
+      });
+      if (!response.ok) {
+        return [];
+      }
+
+      const payload = await response.json().catch(() => null);
+      const rows =
+        payload &&
+        typeof payload === "object" &&
+        Array.isArray((payload as { data?: unknown[] }).data)
+          ? (payload as { data: unknown[] }).data
+          : [];
+
+      const userKeys = rows
+        .map((row) => {
+          if (!row || typeof row !== "object") return "";
+          const userId =
+            "userId" in row && typeof row.userId === "string"
+              ? row.userId
+              : "";
+          return this.syncService.buildUserKeyFromUserId(userId);
+        })
+        .filter((value) => value.length > 0);
+
+      return Array.from(new Set(userKeys));
+    } catch {
+      return [];
+    }
+  }
+
+  private async fetchWorkspaceIdFromProject(
+    request: Request,
+    projectId: string,
+  ): Promise<string | undefined> {
+    const normalizedProjectId = String(projectId || "").trim();
+    if (!normalizedProjectId) {
+      return undefined;
+    }
+
+    const taskBaseUrl = this.resolveTargetBaseUrl("task");
+    const projectBoardUrl = `${taskBaseUrl}/projects/${encodeURIComponent(normalizedProjectId)}/board?page=1&limit=1`;
+    const headers = this.buildForwardHeaders(request, {
+      upstream: "task",
+      upstreamPath: `projects/${normalizedProjectId}/board`,
+    });
+
+    try {
+      const response = await fetch(projectBoardUrl, {
+        method: "GET",
+        headers,
+      });
+      if (!response.ok) {
+        return undefined;
+      }
+
+      const payload = await response.json().catch(() => null);
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        return undefined;
+      }
+
+      return this.normalizeWorkspaceId(
+        this.extractWorkspaceIdFromResponse(
+          payload as Record<string, unknown>,
+        ),
+      );
+    } catch {
+      return undefined;
+    }
+  }
+
+  private resolveTaskDelta(input: {
+    method: string;
+    normalizedUpstreamPath: string;
+    upstreamStatus: number;
+    payload: Record<string, unknown> | null;
+  }): ResolvedTaskDelta | null {
+    const method = String(input.method || "").toUpperCase();
+    if (input.upstreamStatus < 200 || input.upstreamStatus >= 300) {
+      return null;
+    }
+
+    const segments = String(input.normalizedUpstreamPath || "")
+      .split("/")
+      .filter((segment) => segment.length > 0);
+    const data =
+      input.payload &&
+      typeof input.payload.data === "object" &&
+      input.payload.data !== null &&
+      !Array.isArray(input.payload.data)
+        ? (input.payload.data as Record<string, unknown>)
+        : null;
+
+    const taskIdFromPayload =
+      data && typeof data.id === "string" ? data.id.trim() : "";
+    const projectIdFromPayload =
+      data && typeof data.projectId === "string" ? data.projectId.trim() : "";
+
+    if (
+      method === "POST" &&
+      segments.length >= 3 &&
+      ((segments[0] === "workspaces" && segments[2] === "tasks") ||
+        (segments[0] === "projects" && segments[2] === "tasks"))
+    ) {
+      if (!taskIdFromPayload) {
+        return null;
+      }
+      return {
+        operation: "create",
+        taskId: taskIdFromPayload,
+        projectId: projectIdFromPayload || undefined,
+        taskPatch: data,
+      };
+    }
+
+    if (method === "PATCH" && segments[0] === "tasks" && segments[1]) {
+      return {
+        operation: "update",
+        taskId: taskIdFromPayload || segments[1],
+        projectId: projectIdFromPayload || undefined,
+        taskPatch: data,
+      };
+    }
+
+    if (
+      method === "POST" &&
+      segments[0] === "tasks" &&
+      segments[1] &&
+      segments[2] === "move"
+    ) {
+      return {
+        operation: "move",
+        taskId: taskIdFromPayload || segments[1],
+        projectId: projectIdFromPayload || undefined,
+        taskPatch: data,
+      };
+    }
+
+    if (method === "DELETE" && segments[0] === "tasks" && segments[1]) {
+      return {
+        operation: "delete",
+        taskId: segments[1],
+        projectId: projectIdFromPayload || undefined,
+        taskPatch: null,
+      };
+    }
+
+    return null;
+  }
+
+  private resolveAdminOperationFromHttpMethod(method: string): string {
+    const normalizedMethod = String(method || "").toUpperCase();
+    if (normalizedMethod === "POST") return "create";
+    if (normalizedMethod === "DELETE") return "delete";
+    if (normalizedMethod === "PATCH" || normalizedMethod === "PUT") {
+      return "update";
+    }
+    return "unknown";
+  }
+
+  private resolveAdminDeltaPayload(
+    payload: Record<string, unknown> | null,
+    normalizedUpstreamPath: string,
+    workspaceId?: string,
+  ): Record<string, unknown> {
+    const data =
+      payload &&
+      typeof payload.data === "object" &&
+      payload.data !== null &&
+      !Array.isArray(payload.data)
+        ? (payload.data as Record<string, unknown>)
+        : null;
+
+    return {
+      path: normalizedUpstreamPath,
+      workspaceId: workspaceId || null,
+      ...(data ? data : {}),
+    };
+  }
+
+  private resolveAdminRealtimeEvent(input: {
+    request: Request;
+    options: ForwardOptions;
+    normalizedUpstreamPath: string;
+    upstreamStatus: number;
+    payload: Record<string, unknown> | null;
+    workspaceId?: string;
+    taskDelta: ResolvedTaskDelta | null;
+  }): Record<string, unknown> | null {
+    const { options, normalizedUpstreamPath, upstreamStatus, payload } = input;
+    const method = String(input.request.method || "").toUpperCase();
+    const isMutation =
+      method === "POST" || method === "PATCH" || method === "DELETE";
+    const outcome =
+      upstreamStatus >= 200 && upstreamStatus < 300 ? "success" : "failure";
+    const code =
+      payload && typeof payload.code === "string" ? payload.code : "";
+    const message =
+      payload && typeof payload.message === "string" ? payload.message : "";
+
+    if (options.upstream === "auth") {
+      const authPath = normalizedUpstreamPath.replace(/^auth\/?/, "");
+      if (
+        !AUTH_REALTIME_PATHS.has(authPath) &&
+        !authPath.startsWith(AUTH_ADMIN_PATH_PREFIX)
+      ) {
+        return null;
+      }
+      if (!isMutation) {
+        return null;
+      }
+
+      return {
+        eventId: randomUUID(),
+        timestamp: Date.now(),
+        category: "auth",
+        action: authPath || "auth.unknown",
+        outcome,
+        actor: null,
+        targetType: authPath.startsWith("admin/users") ? "user" : "auth",
+        targetId: this.resolveTargetIdFromPath(authPath),
+        workspaceId: null,
+        metadata: {
+          method,
+          status: upstreamStatus,
+          code,
+          message,
+        },
+      };
+    }
+
+    if (options.upstream !== "task") {
+      return null;
+    }
+    if (!isMutation) {
+      return null;
+    }
+
+    const category =
+      input.taskDelta !== null
+        ? "task"
+        : normalizedUpstreamPath.includes("/members")
+          ? "membership"
+          : normalizedUpstreamPath.startsWith("workspaces/")
+            ? "workspace"
+            : normalizedUpstreamPath.startsWith("projects/")
+              ? "project"
+              : "task";
+
+    return {
+      eventId: randomUUID(),
+      timestamp: Date.now(),
+      category,
+      action: normalizedUpstreamPath || "task.unknown",
+      outcome,
+      actor: null,
+      targetType: input.taskDelta ? "task" : category,
+      targetId: input.taskDelta?.taskId || this.resolveTargetIdFromPath(normalizedUpstreamPath),
+      workspaceId: input.workspaceId || null,
+      metadata: {
+        method,
+        status: upstreamStatus,
+        code,
+        message,
+      },
+    };
+  }
+
+  private resolveTargetIdFromPath(path: string): string | null {
+    const segments = String(path || "")
+      .split("/")
+      .filter((segment) => segment.length > 0);
+    if (segments.length < 2) {
+      return null;
+    }
+    return segments[1] || null;
+  }
+
   private shouldPublishInvalidate(
     request: Request,
     options: ForwardOptions,
     upstreamStatus: number,
   ): boolean {
-    if (options.upstream !== 'task') {
+    if (options.upstream !== "task") {
       return false;
     }
 
-    const method = String(request.method || '').toUpperCase();
+    const method = String(request.method || "").toUpperCase();
     const isMutation =
-      method === 'POST' || method === 'PATCH' || method === 'DELETE';
+      method === "POST" || method === "PATCH" || method === "DELETE";
     if (!isMutation) {
       return false;
     }
@@ -258,14 +758,49 @@ export class ProxyService {
     return upstreamStatus >= 200 && upstreamStatus < 300;
   }
 
+  private isTaskMutationPath(method: string, normalizedUpstreamPath: string): boolean {
+    const normalizedMethod = String(method || "").toUpperCase();
+    const segments = String(normalizedUpstreamPath || "")
+      .split("/")
+      .filter((segment) => segment.length > 0);
+
+    if (
+      normalizedMethod === "POST" &&
+      segments.length >= 3 &&
+      ((segments[0] === "workspaces" && segments[2] === "tasks") ||
+        (segments[0] === "projects" && segments[2] === "tasks"))
+    ) {
+      return true;
+    }
+
+    if (
+      segments[0] === "tasks" &&
+      segments[1] &&
+      (normalizedMethod === "PATCH" || normalizedMethod === "DELETE")
+    ) {
+      return true;
+    }
+
+    if (
+      normalizedMethod === "POST" &&
+      segments[0] === "tasks" &&
+      segments[1] &&
+      segments[2] === "move"
+    ) {
+      return true;
+    }
+
+    return false;
+  }
+
   private shouldPublishAdminInvalidate(
     request: Request,
     options: ForwardOptions,
     upstreamStatus: number,
   ): boolean {
-    const method = String(request.method || '').toUpperCase();
+    const method = String(request.method || "").toUpperCase();
     const isMutation =
-      method === 'POST' || method === 'PATCH' || method === 'DELETE';
+      method === "POST" || method === "PATCH" || method === "DELETE";
     if (!isMutation) {
       return false;
     }
@@ -273,22 +808,39 @@ export class ProxyService {
       return false;
     }
 
-    return options.upstream === 'auth' || options.upstream === 'task';
+    return options.upstream === "auth" || options.upstream === "task";
   }
 
-  private resolveAdminInvalidateResource(options: ForwardOptions): string {
-    if (options.upstream === 'task') {
-      return 'admin.tasks';
+  private resolveAdminInvalidateResource(input: {
+    options: ForwardOptions;
+    normalizedUpstreamPath: string;
+    taskDelta: ResolvedTaskDelta | null;
+  }): string {
+    const { options, normalizedUpstreamPath, taskDelta } = input;
+    if (options.upstream === "task") {
+      if (taskDelta) {
+        return "task";
+      }
+      if (normalizedUpstreamPath.includes("/members")) {
+        return "membership";
+      }
+      if (normalizedUpstreamPath.startsWith("workspaces/")) {
+        return "workspace";
+      }
+      if (normalizedUpstreamPath.startsWith("projects/")) {
+        return "project";
+      }
+      return "task";
     }
 
-    const path = String(options.upstreamPath || '').replace(/^\/+/, '');
-    if (path.startsWith('admin/users')) {
-      return 'admin.users';
+    const path = normalizedUpstreamPath.replace(/^auth\/?/, "");
+    if (path.startsWith("admin/users")) {
+      return "user";
     }
-    if (path.startsWith('admin/audit-logs')) {
-      return 'admin.audit';
+    if (path.startsWith("admin/audit-logs")) {
+      return "audit";
     }
-    return 'admin.security';
+    return "security";
   }
 
   private resolveForwardPolicy(
@@ -296,20 +848,23 @@ export class ProxyService {
     normalizedUpstreamPath: string,
   ): ForwardPolicy {
     const defaultPolicy: ForwardPolicy = {
-      maxAttempts: this.configService.get<number>('UPSTREAM_MAX_ATTEMPTS', 3),
-      retryDelayMs: this.configService.get<number>('UPSTREAM_RETRY_DELAY_MS', 400),
-      timeoutMs: this.configService.get<number>('UPSTREAM_TIMEOUT_MS', 15000),
+      maxAttempts: this.configService.get<number>("UPSTREAM_MAX_ATTEMPTS", 3),
+      retryDelayMs: this.configService.get<number>(
+        "UPSTREAM_RETRY_DELAY_MS",
+        400,
+      ),
+      timeoutMs: this.configService.get<number>("UPSTREAM_TIMEOUT_MS", 15000),
     };
 
     if (
-      options.upstream === 'auth' &&
+      options.upstream === "auth" &&
       AUTH_CRITICAL_PATHS.has(normalizedUpstreamPath)
     ) {
       return {
         maxAttempts: 1,
         retryDelayMs: 0,
         timeoutMs: this.configService.get<number>(
-          'AUTH_CRITICAL_UPSTREAM_TIMEOUT_MS',
+          "AUTH_CRITICAL_UPSTREAM_TIMEOUT_MS",
           8000,
         ),
       };
@@ -319,32 +874,32 @@ export class ProxyService {
   }
 
   private normalizeUpstreamPath(path: string): string {
-    return String(path || '')
+    return String(path || "")
       .trim()
-      .replace(/^\/+|\/+$/g, '')
+      .replace(/^\/+|\/+$/g, "")
       .toLowerCase();
   }
 
   private resolveTargetBaseUrl(upstream: UpstreamType): string {
-    if (upstream === 'auth') {
+    if (upstream === "auth") {
       return String(
         this.configService.get<string>(
-          'AUTH_SERVICE_BASE_URL',
-          'http://localhost:3000/api/auth',
+          "AUTH_SERVICE_BASE_URL",
+          "http://localhost:3000/api/auth",
         ),
       )
         .trim()
-        .replace(/\/+$/, '');
+        .replace(/\/+$/, "");
     }
 
     return String(
       this.configService.get<string>(
-        'TASK_SERVICE_BASE_URL',
-        'http://localhost:3102/api',
+        "TASK_SERVICE_BASE_URL",
+        "http://localhost:3002/api",
       ),
     )
       .trim()
-      .replace(/\/+$/, '');
+      .replace(/\/+$/, "");
   }
 
   private buildUpstreamUrl(
@@ -353,10 +908,10 @@ export class ProxyService {
     request: Request,
   ): string {
     const incoming = new URL(
-      request.originalUrl || request.url || '/',
-      'http://localhost',
+      request.originalUrl || request.url || "/",
+      "http://localhost",
     );
-    const normalizedPath = String(upstreamPath || '').replace(/^\/+/, '');
+    const normalizedPath = String(upstreamPath || "").replace(/^\/+/, "");
     const base = normalizedPath
       ? `${targetBaseUrl}/${normalizedPath}`
       : targetBaseUrl;
@@ -378,59 +933,55 @@ export class ProxyService {
       }
 
       const normalizedName = String(name).toLowerCase();
-      if (normalizedName === 'cookie') {
-        if (options.upstream === 'auth') {
+      if (normalizedName === "cookie") {
+        if (options.upstream === "auth") {
           if (Array.isArray(value)) {
-            const joined = value.join('; ').trim();
+            const joined = value.join("; ").trim();
             if (joined) {
-              headers.set('cookie', joined);
+              headers.set("cookie", joined);
             }
           } else {
             const cookieValue = String(value).trim();
             if (cookieValue) {
-              headers.set('cookie', cookieValue);
+              headers.set("cookie", cookieValue);
             }
           }
         }
         continue;
       }
-      if (
-        normalizedName === 'host' ||
-        normalizedName === 'connection' ||
-        normalizedName === 'content-length'
-      ) {
+      if (REQUEST_BLOCKED_HEADERS.has(normalizedName)) {
         continue;
       }
 
       if (Array.isArray(value)) {
-        headers.set(name, value.join(', '));
+        headers.set(name, value.join(", "));
       } else {
         headers.set(name, String(value));
       }
     }
 
-    if (!headers.has('authorization')) {
+    if (!headers.has("authorization")) {
       const tokenFromCookie = this.extractAccessTokenFromCookie(request);
       if (tokenFromCookie) {
-        headers.set('authorization', `Bearer ${tokenFromCookie}`);
+        headers.set("authorization", `Bearer ${tokenFromCookie}`);
       }
     }
 
     const internalProxySecret = String(
-      this.configService.get<string>('INTERNAL_PROXY_SECRET', ''),
+      this.configService.get<string>("INTERNAL_PROXY_SECRET", ""),
     ).trim();
     if (internalProxySecret) {
-      headers.set('x-proxy-secret', internalProxySecret);
+      headers.set("x-proxy-secret", internalProxySecret);
     }
 
     if (request.requestId) {
-      headers.set('x-request-id', request.requestId);
+      headers.set("x-request-id", request.requestId);
     }
 
-    headers.set('x-forwarded-host', String(request.headers.host || ''));
+    headers.set("x-forwarded-host", String(request.headers.host || ""));
     headers.set(
-      'x-forwarded-proto',
-      String(request.headers['x-forwarded-proto'] || 'https'),
+      "x-forwarded-proto",
+      String(request.headers["x-forwarded-proto"] || "https"),
     );
 
     return headers;
@@ -452,8 +1003,9 @@ export class ProxyService {
     } = input;
     const baseBuffer = buffer as Buffer<ArrayBuffer>;
 
-    if (normalizedUpstreamPath === 'logout') {
+    if (normalizedUpstreamPath === "logout") {
       this.clearAccessTokenCookie(response, request);
+      this.clearRefreshTokenCookie(response, request);
       return { buffer: baseBuffer };
     }
 
@@ -472,11 +1024,12 @@ export class ProxyService {
 
     if (payload.requiresTwoFactor === true) {
       this.clearAccessTokenCookie(response, request);
+      this.clearRefreshTokenCookie(response, request);
       return { buffer: baseBuffer };
     }
 
     const accessToken =
-      typeof payload.accessToken === 'string' ? payload.accessToken.trim() : '';
+      typeof payload.accessToken === "string" ? payload.accessToken.trim() : "";
     if (!accessToken) {
       return { buffer: baseBuffer };
     }
@@ -484,18 +1037,35 @@ export class ProxyService {
     const expiresInSeconds = Number(payload.expiresIn);
     this.setAccessTokenCookie(response, request, accessToken, expiresInSeconds);
 
+    const refreshToken =
+      typeof payload.refreshToken === "string"
+        ? payload.refreshToken.trim()
+        : "";
+    const refreshExpiresInSeconds = Number(payload.refreshExpiresIn);
+    if (refreshToken) {
+      this.setRefreshTokenCookie(
+        response,
+        request,
+        refreshToken,
+        refreshExpiresInSeconds,
+      );
+    }
+
     delete payload.accessToken;
+    delete payload.refreshToken;
+    delete payload.refreshExpiresIn;
     return {
-      buffer: Buffer.from(JSON.stringify(payload)) as Buffer<ArrayBuffer>,
+      buffer: Buffer.from(JSON.stringify(payload)),
     };
   }
 
   private extractAccessTokenFromCookie(request: Request): string {
     const cookieName = this.getAccessTokenCookieName();
     const cookies = request.cookies as Record<string, unknown> | undefined;
-    const token = cookies && typeof cookies[cookieName] === 'string'
-      ? String(cookies[cookieName]).trim()
-      : '';
+    const token =
+      cookies && typeof cookies[cookieName] === "string"
+        ? String(cookies[cookieName]).trim()
+        : "";
     return token;
   }
 
@@ -505,18 +1075,15 @@ export class ProxyService {
     token: string,
     expiresInSeconds: number,
   ): void {
-    const maxAgeMs = Number.isFinite(expiresInSeconds) && expiresInSeconds > 0
-      ? Math.floor(expiresInSeconds * 1000)
-      : 60 * 60 * 1000;
+    const maxAgeMs =
+      Number.isFinite(expiresInSeconds) && expiresInSeconds > 0
+        ? Math.floor(expiresInSeconds * 1000)
+        : 60 * 60 * 1000;
 
-    response.cookie(
-      this.getAccessTokenCookieName(),
-      token,
-      {
-        ...this.getAccessTokenCookieBaseOptions(request),
-        maxAge: maxAgeMs,
-      },
-    );
+    response.cookie(this.getAccessTokenCookieName(), token, {
+      ...this.getAccessTokenCookieBaseOptions(request),
+      maxAge: maxAgeMs,
+    });
   }
 
   private clearAccessTokenCookie(response: Response, request: Request): void {
@@ -526,48 +1093,88 @@ export class ProxyService {
     );
   }
 
+  private setRefreshTokenCookie(
+    response: Response,
+    request: Request,
+    token: string,
+    expiresInSeconds: number,
+  ): void {
+    const maxAgeMs =
+      Number.isFinite(expiresInSeconds) && expiresInSeconds > 0
+        ? Math.floor(expiresInSeconds * 1000)
+        : 3 * 24 * 60 * 60 * 1000;
+    response.cookie(this.getRefreshTokenCookieName(), token, {
+      ...this.getAccessTokenCookieBaseOptions(request),
+      maxAge: maxAgeMs,
+    });
+  }
+
+  private clearRefreshTokenCookie(response: Response, request: Request): void {
+    response.clearCookie(
+      this.getRefreshTokenCookieName(),
+      this.getAccessTokenCookieBaseOptions(request),
+    );
+  }
+
   private getAccessTokenCookieName(): string {
     const configured = String(
-      this.configService.get<string>('AUTH_ACCESS_COOKIE_NAME', 'ctm_at'),
+      this.configService.get<string>("AUTH_ACCESS_COOKIE_NAME", "ctm_at"),
     ).trim();
-    return configured || 'ctm_at';
+    return configured || "ctm_at";
+  }
+
+  private getRefreshTokenCookieName(): string {
+    const configured = String(
+      this.configService.get<string>("AUTH_REFRESH_COOKIE_NAME", "ctm_rt"),
+    ).trim();
+    return configured || "ctm_rt";
   }
 
   private getAccessTokenCookieBaseOptions(request: Request): {
     httpOnly: true;
     secure: boolean;
-    sameSite: 'lax' | 'strict' | 'none';
+    sameSite: "lax" | "strict" | "none";
     path: string;
     domain?: string;
   } {
     const configuredSameSite = String(
-      this.configService.get<string>('AUTH_ACCESS_COOKIE_SAMESITE', 'strict'),
+      this.configService.get<string>("AUTH_ACCESS_COOKIE_SAMESITE", "lax"),
     )
       .trim()
       .toLowerCase();
-    const sameSite: 'lax' | 'strict' | 'none' =
-      configuredSameSite === 'lax' || configuredSameSite === 'none'
+    const sameSite: "lax" | "strict" | "none" =
+      configuredSameSite === "strict" ||
+      configuredSameSite === "lax" ||
+      configuredSameSite === "none"
         ? configuredSameSite
-        : 'strict';
-    const nodeEnv = String(this.configService.get<string>('NODE_ENV', 'development')).trim();
+        : "lax";
+    const nodeEnv = String(
+      this.configService.get<string>("NODE_ENV", "development"),
+    ).trim();
+    const requiresCrossOriginCookie = this.shouldUseCrossOriginCookiePolicy(
+      request,
+    );
+    const preferredSameSite: "lax" | "strict" | "none" =
+      requiresCrossOriginCookie ? "none" : sameSite;
     const isHttpsRequest =
       request.secure ||
-      String(request.headers['x-forwarded-proto'] || '')
+      String(request.headers["x-forwarded-proto"] || "")
         .toLowerCase()
-        .includes('https');
-    const secure = nodeEnv === 'production' ? true : sameSite === 'none' && isHttpsRequest;
-    const effectiveSameSite: 'lax' | 'strict' | 'none' =
-      sameSite === 'none' && !secure ? 'strict' : sameSite;
-    const domain = String(
-      this.configService.get<string>('AUTH_ACCESS_COOKIE_DOMAIN', ''),
-    ).trim();
+        .includes("https");
+    const secure =
+      nodeEnv === "production"
+        ? true
+        : preferredSameSite === "none" && isHttpsRequest;
+    const effectiveSameSite: "lax" | "strict" | "none" =
+      preferredSameSite === "none" && !secure ? "strict" : preferredSameSite;
+    const domain = this.resolveCookieDomain(request);
 
     if (domain) {
       return {
         httpOnly: true,
         secure,
         sameSite: effectiveSameSite,
-        path: '/',
+        path: "/",
         domain,
       };
     }
@@ -576,8 +1183,106 @@ export class ProxyService {
       httpOnly: true,
       secure,
       sameSite: effectiveSameSite,
-      path: '/',
+      path: "/",
     };
+  }
+
+  private shouldUseCrossOriginCookiePolicy(request: Request): boolean {
+    const rawOrigin = String(request.headers.origin || "").trim();
+    if (!rawOrigin) {
+      return false;
+    }
+
+    let originHost = "";
+    try {
+      originHost = this.normalizeHost(new URL(rawOrigin).host);
+    } catch {
+      return false;
+    }
+    if (!originHost) {
+      return false;
+    }
+
+    const requestHost = this.resolvePublicRequestHost(request);
+    if (!requestHost) {
+      return false;
+    }
+
+    return originHost !== requestHost;
+  }
+
+  private resolveCookieDomain(request: Request): string {
+    const configuredDomain = String(
+      this.configService.get<string>("AUTH_ACCESS_COOKIE_DOMAIN", ""),
+    )
+      .trim()
+      .toLowerCase();
+    if (!configuredDomain) {
+      return "";
+    }
+
+    const normalizedDomain = configuredDomain.replace(/^\./, "");
+    if (!normalizedDomain) {
+      return "";
+    }
+
+    const requestHost = this.resolvePublicRequestHost(request);
+    if (!requestHost) {
+      return "";
+    }
+
+    const isMatchingDomain =
+      requestHost === normalizedDomain ||
+      requestHost.endsWith(`.${normalizedDomain}`);
+    if (!isMatchingDomain) {
+      return "";
+    }
+
+    return configuredDomain.startsWith(".")
+      ? configuredDomain
+      : `.${configuredDomain}`;
+  }
+
+  private resolvePublicRequestHost(request: Request): string {
+    const forwardedHost = this.parseHostHeader(request.headers["x-forwarded-host"]);
+    if (forwardedHost) {
+      return forwardedHost;
+    }
+
+    const hostHeader = this.parseHostHeader(request.headers.host);
+    if (hostHeader) {
+      return hostHeader;
+    }
+
+    return this.normalizeHost(String(request.hostname || ""));
+  }
+
+  private parseHostHeader(rawHost: unknown): string {
+    if (Array.isArray(rawHost) && rawHost.length > 0) {
+      return this.normalizeHost(String(rawHost[0]));
+    }
+    if (typeof rawHost !== "string") {
+      return "";
+    }
+
+    const firstHost = rawHost.split(",")[0];
+    return this.normalizeHost(firstHost);
+  }
+
+  private normalizeHost(rawHost: string): string {
+    const candidate = String(rawHost || "").trim().toLowerCase();
+    if (!candidate) {
+      return "";
+    }
+
+    if (candidate.startsWith("[")) {
+      const closingBracket = candidate.indexOf("]");
+      return closingBracket > 0
+        ? candidate.slice(0, closingBracket + 1)
+        : candidate;
+    }
+
+    return candidate.replace(/:\d+$/, "");
   }
 
   private resolveWorkspaceIdHint(
@@ -587,7 +1292,7 @@ export class ProxyService {
     responseBuffer: Buffer,
   ): string | undefined {
     const fromHeader = this.normalizeWorkspaceId(
-      this.extractStringValue(request.headers['x-workspace-id']),
+      this.extractStringValue(request.headers["x-workspace-id"]),
     );
     if (fromHeader) return fromHeader;
 
@@ -615,9 +1320,9 @@ export class ProxyService {
   }
 
   private resolveWorkspaceIdFromPath(upstreamPath: string): string | undefined {
-    const normalized = String(upstreamPath || '').replace(/^\/+/, '');
-    const segments = normalized.split('/').filter((part) => part.length > 0);
-    if (segments.length >= 2 && segments[0] === 'workspaces') {
+    const normalized = String(upstreamPath || "").replace(/^\/+/, "");
+    const segments = normalized.split("/").filter((part) => part.length > 0);
+    if (segments.length >= 2 && segments[0] === "workspaces") {
       return this.normalizeWorkspaceId(segments[1]);
     }
     return undefined;
@@ -628,17 +1333,14 @@ export class ProxyService {
     responseBuffer: Buffer,
   ): Record<string, unknown> | null {
     const contentType = String(
-      upstreamResponse.headers.get('content-type') || '',
+      upstreamResponse.headers.get("content-type") || "",
     ).toLowerCase();
-    if (!contentType.includes('application/json')) {
+    if (!contentType.includes("application/json")) {
       return null;
     }
 
     try {
-      const parsed = JSON.parse(responseBuffer.toString('utf8'));
-      return parsed && typeof parsed === 'object'
-        ? (parsed as Record<string, unknown>)
-        : null;
+      return parseJsonRecord(responseBuffer.toString("utf8"));
     } catch {
       return null;
     }
@@ -647,7 +1349,7 @@ export class ProxyService {
   private extractWorkspaceIdFromResponse(
     payload: Record<string, unknown> | null,
   ): string {
-    if (!payload) return '';
+    if (!payload) return "";
 
     const direct = this.extractStringValue(payload.workspaceId);
     if (direct) return direct;
@@ -660,21 +1362,21 @@ export class ProxyService {
     const fromProject = this.extractStringValue(project?.workspaceId);
     if (fromProject) return fromProject;
 
-    return '';
+    return "";
   }
 
   private extractStringValue(value: unknown): string {
-    if (typeof value === 'string') {
+    if (typeof value === "string") {
       return value.trim();
     }
-    if (Array.isArray(value) && typeof value[0] === 'string') {
+    if (Array.isArray(value) && typeof value[0] === "string") {
       return value[0].trim();
     }
-    return '';
+    return "";
   }
 
   private normalizeWorkspaceId(value: string): string | undefined {
-    const candidate = String(value || '').trim();
+    const candidate = String(value || "").trim();
     if (
       /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
         candidate,
@@ -686,11 +1388,11 @@ export class ProxyService {
   }
 
   private buildRequestBody(request: Request): BodyInit | undefined {
-    if (request.method === 'GET' || request.method === 'HEAD') {
+    if (request.method === "GET" || request.method === "HEAD") {
       return undefined;
     }
 
-    const body = request.body;
+    const body: unknown = request.body;
     if (body === undefined || body === null) {
       return undefined;
     }
@@ -699,11 +1401,11 @@ export class ProxyService {
       return body as BodyInit;
     }
 
-    if (typeof body === 'string') {
+    if (typeof body === "string") {
       return body;
     }
 
-    if (typeof body === 'object') {
+    if (typeof body === "object") {
       return JSON.stringify(body);
     }
 
@@ -715,23 +1417,23 @@ export class ProxyService {
     response: Response,
   ): void {
     const setCookies =
-      typeof upstreamResponse.headers.getSetCookie === 'function'
+      typeof upstreamResponse.headers.getSetCookie === "function"
         ? upstreamResponse.headers.getSetCookie()
         : [];
 
     if (setCookies.length > 0) {
-      response.setHeader('set-cookie', setCookies);
+      response.setHeader("set-cookie", setCookies);
     } else {
-      const singleSetCookie = upstreamResponse.headers.get('set-cookie');
+      const singleSetCookie = upstreamResponse.headers.get("set-cookie");
       if (singleSetCookie) {
-        response.setHeader('set-cookie', singleSetCookie);
+        response.setHeader("set-cookie", singleSetCookie);
       }
     }
 
     upstreamResponse.headers.forEach((value, name) => {
       const normalizedName = name.toLowerCase();
       if (
-        normalizedName === 'set-cookie' ||
+        normalizedName === "set-cookie" ||
         HOP_BY_HOP_HEADERS.has(normalizedName)
       ) {
         return;
@@ -746,8 +1448,11 @@ export class ProxyService {
       return true;
     }
 
-    const message = error instanceof Error ? error.message.toLowerCase() : '';
-    if (message.includes('fetch failed') || message.includes('connect timeout')) {
+    const message = error instanceof Error ? error.message.toLowerCase() : "";
+    if (
+      message.includes("fetch failed") ||
+      message.includes("connect timeout")
+    ) {
       return true;
     }
 
@@ -755,23 +1460,132 @@ export class ProxyService {
   }
 
   private extractErrorCode(error: unknown): string {
-    if (!error || typeof error !== 'object') {
-      return '';
+    if (!error || typeof error !== "object") {
+      return "";
     }
 
-    if ('code' in error && typeof error.code === 'string') {
+    if ("code" in error && typeof error.code === "string") {
       return error.code;
     }
 
-    const cause = 'cause' in error ? error.cause : undefined;
-    if (cause && typeof cause === 'object' && 'code' in cause && typeof cause.code === 'string') {
+    const cause = "cause" in error ? error.cause : undefined;
+    if (
+      cause &&
+      typeof cause === "object" &&
+      "code" in cause &&
+      typeof cause.code === "string"
+    ) {
       return cause.code;
     }
 
-    return '';
+    return "";
   }
 
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  private logForwardFailure(input: {
+    error: unknown;
+    isTimeout: boolean;
+    upstream: UpstreamType;
+    upstreamPath: string;
+    requestId?: string;
+  }): void {
+    const { error, isTimeout, upstream, upstreamPath, requestId } = input;
+    const code = this.extractErrorCode(error);
+    const name = error instanceof Error ? error.name : "UnknownError";
+    const message =
+      error instanceof Error ? error.message : this.stringifyLogValue(error);
+    const requestIdText = requestId ? ` request_id=${requestId}` : "";
+
+    this.logger.warn(
+      `${isTimeout ? "timeout" : "failure"} upstream=${upstream} path=${upstreamPath || "/"} code=${code || "n/a"} name=${name} message="${message}"${requestIdText}`,
+    );
+  }
+
+  private shouldLogTaskForward(
+    options: ForwardOptions,
+    normalizedUpstreamPath: string,
+  ): boolean {
+    if (options.upstream !== "task") {
+      return false;
+    }
+
+    return TASK_OBSERVED_PATH_PREFIXES.some(
+      (prefix) =>
+        normalizedUpstreamPath === prefix ||
+        normalizedUpstreamPath.startsWith(`${prefix}/`),
+    );
+  }
+
+  private extractUpstreamCodeAndMessage(
+    payload: Record<string, unknown> | null,
+  ): {
+    code: string;
+    message: string;
+  } {
+    if (!payload) {
+      return { code: "", message: "" };
+    }
+
+    const codeValue = payload.code;
+    const messageValue = payload.message ?? payload.error;
+    const code = typeof codeValue === "string" ? codeValue.trim() : "";
+    const message = typeof messageValue === "string" ? messageValue.trim() : "";
+    return {
+      code,
+      message: message.replace(/\s+/g, " ").slice(0, 180),
+    };
+  }
+
+  private logTaskForwardResult(input: {
+    request: Request;
+    upstreamPath: string;
+    upstreamStatus: number;
+    upstreamCode?: string;
+    upstreamMessage?: string;
+    upstreamRequestId?: string;
+  }): void {
+    const {
+      request,
+      upstreamPath,
+      upstreamStatus,
+      upstreamCode,
+      upstreamMessage,
+      upstreamRequestId,
+    } = input;
+    const details = [
+      `method=${String(request.method || "").toUpperCase() || "GET"}`,
+      `path=${upstreamPath || "/"}`,
+      `upstream_status=${upstreamStatus}`,
+      `request_id=${request.requestId || "n/a"}`,
+      upstreamRequestId ? `upstream_request_id=${upstreamRequestId}` : "",
+      upstreamCode ? `upstream_code=${upstreamCode}` : "",
+      upstreamMessage ? `upstream_message="${upstreamMessage}"` : "",
+    ]
+      .filter((part) => part.length > 0)
+      .join(" ");
+
+    this.logger.log(`task_forward ${details}`);
+  }
+
+  private stringifyLogValue(value: unknown): string {
+    if (
+      value === undefined ||
+      value === null ||
+      typeof value === "string" ||
+      typeof value === "number" ||
+      typeof value === "boolean" ||
+      typeof value === "bigint"
+    ) {
+      return String(value ?? "");
+    }
+
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return "[unserializable]";
+    }
   }
 }

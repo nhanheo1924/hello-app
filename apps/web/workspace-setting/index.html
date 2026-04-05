@@ -4,11 +4,29 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Workspace Settings</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 </head>
-<body style="margin:0;background:#050508;color:#fff;font-family:Times New Roman,serif;display:flex;align-items:center;justify-content:center;min-height:100vh;">
-    <div style="opacity:0.82;letter-spacing:0.04em;">Opening workspace settings...</div>
+<body style="margin:0;background:#050508;color:#fff;font-family:'Be Vietnam Pro','Segoe UI','Helvetica Neue',Arial,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;">
+    <div id="workspaceSettingsRedirectLabel" style="opacity:0.82;letter-spacing:0.04em;">Opening workspace settings...</div>
     <script>
         (() => {
+            try {
+                const raw = localStorage.getItem('orbitSettings');
+                const parsed = raw ? JSON.parse(raw) : null;
+                const language = String(parsed?.account?.language || '').trim().toLowerCase();
+                if (language === 'vi') {
+                    document.documentElement.setAttribute('lang', 'vi');
+                    const label = document.getElementById('workspaceSettingsRedirectLabel');
+                    if (label) {
+                        label.textContent = 'Đang mở cài đặt không gian làm việc...';
+                    }
+                }
+            } catch (_) {
+                // ignore language restore failures
+            }
+
             const url = new URL('../home/', window.location.href);
             const incoming = new URLSearchParams(window.location.search || '');
             incoming.set('openWorkspaceSettings', '1');

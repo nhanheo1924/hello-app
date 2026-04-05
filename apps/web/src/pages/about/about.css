@@ -1,3 +1,9 @@
+@import url('https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700;800&display=swap');
+
+:root {
+    --font-ui: 'Be Vietnam Pro', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+}
+
 html {
     font-size: calc(17px * 1.18);
 }
@@ -65,7 +71,7 @@ a:hover {
 
 /* Global font override */
 *, *::before, *::after {
-    font-family: "Times New Roman", Times, serif !important;
+    font-family: var(--font-ui) !important;
 }
 body {
     background: #070708;

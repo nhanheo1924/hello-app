@@ -1,7 +1,10 @@
+@import url('https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700;800&display=swap');
+
 html {
   font-size: 16px;
 }
 :root {
+  --font-ui: 'Be Vietnam Pro', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
   --fg: #fff;
   --muted: #bdbdbd;
 }
@@ -12,7 +15,7 @@ html {
 
 body {
   margin: 0;
-  font-family: 'Sinoreta', sans-serif;
+  font-family: var(--font-ui);
   background: #000;
   color: var(--fg);
   overflow-x: hidden;
@@ -70,7 +73,7 @@ header {
 
 .logo {
   width: min(420px, 70vw);
-  font-family: 'Sinoreta', serif;
+  font-family: var(--font-ui);
   animation: fadeUp 1.2s ease forwards, glow 3s ease-in-out infinite alternate;
 }
 
@@ -146,7 +149,7 @@ section {
 
 h2 {
   text-align: center;
-  font-family: 'Sinoreta', serif;
+  font-family: var(--font-ui);
 }
 
 .board {
@@ -178,12 +181,12 @@ footer {
 }
 
 .cta .btn{
-  font-family: 'Sinoreta';
+  font-family: var(--font-ui);
 }
 
 /* Global font override */
 *, *::before, *::after {
-  font-family: "Times New Roman", Times, serif !important;
+  font-family: var(--font-ui) !important;
 }
 
 /* Neutral accessibility override */

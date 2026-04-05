@@ -1,3 +1,5 @@
+@import url('https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700;800&display=swap');
+
 html {
     font-size: 16px;
 }
@@ -19,6 +21,7 @@ html {
     font-weight: bold;
 }
 :root {
+    --font-ui: 'Be Vietnam Pro', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
     --glass: rgba(255, 255, 255, 0.025);
     --glass-border: rgba(255, 255, 255, 0.08);
     --glass-border-bright: rgba(255, 255, 255, 0.15);
@@ -36,7 +39,7 @@ html {
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
 body {
-    font-family: 'Sinoreta', serif;
+    font-family: var(--font-ui);
     background: #050508;
     color: #fff;
     height: 100vh;
@@ -943,7 +946,7 @@ body.fade-out {
 }
 
 .resizer::after {
-    content: 'â‹®';
+    content: '\22EE';
     font-size: 0.6rem;
     color: rgba(255,255,255,0.4);
 }
@@ -1804,7 +1807,7 @@ a:focus-visible,
 }
 
 .resizer::after {
-    content: 'â‹®';
+    content: '\22EE';
 }
 
 .time-estimate {
@@ -1823,7 +1826,7 @@ a:focus-visible,
 
 /* Dashboard v3 override: Times New Roman + vertical week layout */
 *, *::before, *::after {
-    font-family: "Times New Roman", Times, serif !important;
+    font-family: var(--font-ui) !important;
 }
 
 :root {
@@ -2386,3 +2389,4 @@ body {
     accent-color: #ffffff;
     cursor: pointer;
 }
+

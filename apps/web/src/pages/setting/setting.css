@@ -1,7 +1,10 @@
+@import url('https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700;800&display=swap');
+
 html {
     font-size: 16px;
 }
 :root {
+    --font-ui: 'Be Vietnam Pro', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
     --glass: rgba(255,255,255,0.025);
     --glass-border: rgba(255,255,255,0.08);
     --glass-border-bright: rgba(255,255,255,0.15);
@@ -12,7 +15,7 @@ html {
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
 body {
-    font-family: 'Sinoreta', serif;
+    font-family: var(--font-ui);
     background: #050508;
     color: #fff;
     height: 100vh;
@@ -368,7 +371,7 @@ body {
     box-shadow: 0 0 10px rgba(255,255,255,0.25);
 }
 .swatch.active::after {
-    content: 'âœ“'; position: absolute; inset: 0;
+    content: '\2713'; position: absolute; inset: 0;
     display: flex; align-items: center; justify-content: center;
     font-size: 0.6rem; color: rgba(0,0,0,0.7); font-weight: bold;
 }
@@ -631,7 +634,7 @@ body {
 
 /* Global font override */
 *, *::before, *::after {
-    font-family: "Times New Roman", Times, serif !important;
+    font-family: var(--font-ui) !important;
 }
 
 /* Neutral accessibility override */
@@ -672,3 +675,4 @@ body {
 .range-slider::-webkit-slider-thumb {
     background: rgba(255,255,255,0.9);
 }
+
