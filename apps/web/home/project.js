@@ -50,6 +50,8 @@ const REMOTE_WORKSPACE_LOAD_CONCURRENCY = 3;
 const REALTIME_INVALIDATE_DEBOUNCE_MS = 500;
 const REALTIME_TASK_INVALIDATE_FALLBACK_MS = 700;
 const REALTIME_TASK_INVALIDATE_RECENT_DELTA_MS = 1500;
+const TASK_SUBMIT_COOLDOWN_MS = 800;
+const TASK_CREATE_SPAM_WINDOW_MS = 5000;
 const TASK_AUTH_FAILURE_EVENT = 'orbit:task-auth-failure';
 const TASK_AUTH_SUCCESS_EVENT = 'orbit:task-auth-success';
 const AUTH_FAILURE_WINDOW_MS = 30 * 1000;
@@ -167,6 +169,11 @@ const state = {
         status: 'All',
         member: 'All',
         debounceTimer: null
+    },
+    taskSubmit: {
+        busyUntil: 0,
+        lastCreateSignature: '',
+        lastCreateAt: 0
     },
     workspaceDisplaySettings: {}
 };
@@ -1590,6 +1597,45 @@ function buildTaskCreateIdempotencyKey(task, workspaceId) {
     const fallback = `${titlePart}:${startDatePart}:${startTimePart}:${assigneePart}`;
     const stablePart = localTaskId || fallback;
     return `task-create:${workspacePart}:${stablePart}`.slice(0, 128);
+}
+
+function buildTaskCreateSpamSignature(task, workspaceId) {
+    const workspacePart = isUuid(workspaceId) ? workspaceId : '';
+    const titlePart = sanitizeText(task && task.name, 120).toLowerCase();
+    const startDatePart = isISODate(task && task.startDate) ? task.startDate : '';
+    const startTimePart = isTimeValue(task && task.startTime) ? task.startTime : '';
+    const endDatePart = isISODate(task && task.endDate) ? task.endDate : '';
+    const endTimePart = isTimeValue(task && task.endTime) ? task.endTime : '';
+    const statusPart = TASK_STATUSES.includes(task && task.status) ? String(task.status) : '';
+    const priorityPart = TASK_PRIORITIES.includes(task && task.priority) ? String(task.priority) : '';
+    const assigneePart = isUuid(task && task.memberUserId)
+        ? task.memberUserId
+        : sanitizeText(task && task.memberName, 40).toLowerCase();
+    return [
+        workspacePart,
+        titlePart,
+        startDatePart,
+        startTimePart,
+        endDatePart,
+        endTimePart,
+        statusPart,
+        priorityPart,
+        assigneePart
+    ].join('|');
+}
+
+function rememberTaskCreateSpamSignature(signature) {
+    state.taskSubmit.lastCreateSignature = signature;
+    state.taskSubmit.lastCreateAt = Date.now();
+}
+
+function isTaskCreateSpam(signature) {
+    if (!signature) return false;
+    const lastSignature = String(state.taskSubmit.lastCreateSignature || '');
+    const lastCreateAt = Number(state.taskSubmit.lastCreateAt || 0);
+    if (!lastSignature || !lastCreateAt) return false;
+    const elapsed = Date.now() - lastCreateAt;
+    return signature === lastSignature && elapsed >= 0 && elapsed < TASK_CREATE_SPAM_WINDOW_MS;
 }
 
 function normalizeIsoTimestamp(value) {
@@ -5064,6 +5110,16 @@ function saveTask() {
         showTaskOwnershipDenied('edit tasks');
         return;
     }
+    const now = Date.now();
+    if (now < Number(state.taskSubmit.busyUntil || 0)) {
+        showErrorToast(
+            'Task submission is already in progress. Please wait a moment.',
+            'Task Busy',
+            { code: 'TASK_SAVE_SUBMIT_COOLDOWN' }
+        );
+        return;
+    }
+    state.taskSubmit.busyUntil = now + TASK_SUBMIT_COOLDOWN_MS;
 
     const mutationLockKey = currentTaskData && typeof currentTaskData.id === 'string' && currentTaskData.id
         ? `task:save:${currentTaskData.id}`
@@ -5185,6 +5241,19 @@ function saveTask() {
 
             payload.left = clamp(payload.left, 0, maxWidth);
             payload.width = clamp(payload.width, state.hourWidth * 0.25, Math.max(state.hourWidth * 0.25, maxWidth - payload.left));
+            if (!currentTaskData) {
+                const workspaceId = getProjectWorkspaceId(activeProject) || (isUuid(activeProject.id) ? activeProject.id : '');
+                const createSignature = buildTaskCreateSpamSignature(payload, workspaceId);
+                if (isTaskCreateSpam(createSignature)) {
+                    showErrorToast(
+                        'Duplicate task create request was blocked. Please wait a few seconds before retrying the same task.',
+                        'Task Blocked',
+                        { code: 'TASK_CREATE_DUPLICATE_BLOCKED' }
+                    );
+                    return;
+                }
+                rememberTaskCreateSpamSignature(createSignature);
+            }
 
             if (!Array.isArray(activeProject.tasks)) {
                 activeProject.tasks = [];
